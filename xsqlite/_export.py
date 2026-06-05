@@ -10,7 +10,7 @@ from bitstring import ConstBitStream as _CB
 from os.path import abspath as _abspath
 from os.path import expanduser as _expanduser
 from os.path import exists as _exists
-import bigfloat as _bigfloat
+import mpmath as _mpmath
 import xlsxwriter as _xlsxwriter
 import csv as _csv
 
@@ -226,20 +226,21 @@ def stringlify(value, nullvalue='NULL', dumpformat=True, tsvformat=False):
         # by sqlite3 in order to obtain the exact same value upon subsequent
         # import.
 
-        with _bigfloat.precision(64):
-            # convert to bigfloat with 64 bits precision
-            val = _bigfloat.BigFloat(value)
-            # store .15g representation in r1
-            r1 = sqlite3VXPrintf(val, 1)
-            # parse the converted value back into r2
-            r2 = _bigfloat.BigFloat.exact(r1, precision=64)
-            # compare r2 with original as IEEE 754 float (python native float)
-            if float(val) == float(r2):
-                # exact match, save to represent as .15g
-                return r1
-            else:
-                # not an exact match, need .20e representation
-                return sqlite3VXPrintf(val, 2)
+        # we need 80 bit precision
+        _mpmath.mp.prec = 80
+        # convert value to value with 80 bit precision
+        val = _mpmath.mpf(value)
+        # convert this value to .15g representation
+        r1 = sqlite3VXPrintf(val, 1)
+        # parse the converted value back into r2
+        r2 = _mpmath.mpf(r1)
+        # compare r2 with original as IEEE 754 float (python native float)
+        if float(val) == float(r2):
+            # exact match, safe to represent as .15g
+            return r1
+        else:
+            # not an exact match, need .20e representation
+            return sqlite3VXPrintf(val, 2)
 
     else:
         return str(value)
@@ -287,7 +288,7 @@ def sqlite3VXPrintf(value, case=1):
         prefix = '-'
 
     # line 472, NaN
-    if _bigfloat.is_nan(realvalue):
+    if _mpmath.isnan(realvalue):
         return 'NaN'
 
     # line 477, normalize to within (10.0, 1.0] range:

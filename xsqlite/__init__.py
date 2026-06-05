@@ -4,7 +4,7 @@ Copyright (c) 2022 Netherlands Forensic Institute - MIT License
 '''
 
 def _modcheck():
-    ''' check if we have at least version 3.1.3 of bitstring module and some version of bigfloat '''
+    ''' check if we have at least version 3.1.3 of bitstring module '''
 
     try:
         import bitstring as _bitstring
@@ -19,11 +19,6 @@ def _modcheck():
         raise ImportError(err)
     elif int(major) == 3 and int(patch) < 2:
         raise ImportError(err)
-
-    try:
-        import bigfloat as _bigfloat
-    except:
-        raise ImportError('this package requires the bigfloat module')
 
     try:
         import xlsxwriter
