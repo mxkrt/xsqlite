@@ -795,13 +795,6 @@ def _sqlite3VXPrintf(value, case=1):
     terminology) is ported.
     '''
 
-    import mpmath as _mpmath
-    # we need 80 bit precision (TODO: do we need this?)
-    _mpmath.mp.prec = 80
-    # convert value to value with 80 bit precision
-    value = _mpmath.mpf(value)
-
-
     # realvalue will be changed, keep value for normal .15g representation
     realvalue = value
 
