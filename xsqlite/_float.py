@@ -1,14 +1,21 @@
 ''' _float_conversion - Python implementation of float related sqlite3 code
 
-Functions that mimic the behaviour of various functions in util.c used in
-the conversion of floating point values to a text representation that is
-used in the ".dump" command. Based on analysis of the sqlite3 sources,
-version 3530200.
+SQLite3 takes extra care to make sure the text representation of an IEEE-754
+double preserves enough precision to be round-trip safe when importing the
+same text representation back into an SQLite3 database, while trying to keep
+the text representation as short/readable as possible.
+
+In order for our ".dump" implementation to behave in the same manner, we need
+to implement part of this logic in xsqlite. This source file contains part of
+the functions in printf.c and util.c that we use to mimic the floating point
+conversion behaviour. This is based on analysis of source version 3530200,
+downloaded from here: https://sqlite.org/2026/sqlite-src-3530200.zip
 '''
 
 import struct as _struct
 from binascii import hexlify as _hexlify
 import math as _math
+from collections import namedtuple as _nt
 
 # range of powers of 10 that we need to deal with
 # when converting IEEE754 doubls to and from decimal.
@@ -35,16 +42,16 @@ sqlite3DigitPairs = "00010203040506070809" +\
                     "80818283848586878889" +\
                     "90919293949596979899"
 
-class FpDecode:
-    ''' mimic FpDecode struct from sqliteInt.h '''
 
-    def __init__(s):
-        s.n = None         # significant digits
-        s.iDP = None       # location of decimal point
-        s.z = []           # store the significant digits
-                           # (this simulates zBuf array with z pointer)
-        s.sign = None      # + or -
-        s.isSpecial = None # 1: Infinity 2: NaN
+# object that receives the decoding of a floating point value
+# into an approximate decimal representation (sqliteInt.h, 4840)
+# n         : Significant digits in the decode
+# iDP       : Location of decimal point
+# z         : Start of significant bits (ptr -> index in Python)
+# zBuf      : Storage for significant digits (char array -> list in Python)
+# sign      : '+' or '-'
+# isSpecial : 1: Infinity, 2: NaN
+FpDecode_t = _nt('FpDecode', 'n iDP z zBuf sign isSpecial')
 
 
 def U64_BIT(n): 
@@ -309,9 +316,9 @@ def sqlite3FpDecode(r, iRound, mxRound, debug=False):
     if debug is True:
         print(f"-> sqlite3FpDecode({_hexlify(r),iRound,mxRound})")
 
-    # return value
-    p = FpDecode()
-    p.isSpecial = 0
+    # initialize return value
+    # util.c, line 1393: p->isSpecial=0
+    p = FpDecode_t(0,0,0,[],'',0)
     if mxRound < 0:
         raise ValueError("expected mxRound > 0")
 
@@ -322,19 +329,16 @@ def sqlite3FpDecode(r, iRound, mxRound, debug=False):
         print(f"   sqlite3FpDecode: {decoded_r}")
 
     if decoded_r < 0:
-        p.sign = '-'
+        p = p._replace(sign='-')
         r = _struct.pack('>d', -decoded_r)
 
     elif decoded_r == 0.0:
-        p.sign = '+'
-        p.n = 1
-        p.iDP = 1
-        p.z = 0
-        p.zBuf = [0]
+        # util.c, line 1402
+        p = p._replace(sign='+', n=1, iDP=1, z=0, zBuf=[0])
         return p
 
     else:
-        p.sign = '+'
+        p = p._replace(sign='+')
 
     # copy the bytes into v and convert to int
     v = int.from_bytes(r[0:8], "big")
@@ -346,12 +350,12 @@ def sqlite3FpDecode(r, iRound, mxRound, debug=False):
 
     if (e == 0x7ff):
         # this is either infinit or NaN
-        p.isSpecial = 1 + v != 0x7ff0000000000000
-        p.n = 0
-        p.iDP = 0
-        p.z = 0
+        # util.c line 1413
+        isSpecial = 1 + v != 0x7ff0000000000000
+        p = p._replace(n=0, iDP=0, z=0, isSpecial=isSpecial)
         return p
 
+    # util.c, line 1419
     v &= 0x000FFFFFFFFFFFFF
     vbytes = v.to_bytes(8, 'big')
 
@@ -359,15 +363,13 @@ def sqlite3FpDecode(r, iRound, mxRound, debug=False):
         print(f"   sqlite3FpDecode: v={_hexlify(vbytes)}")
 
     if e == 0:
-        # count leading zero's
-        raise ValueError("check!")
-        nn = len(hex(0xFFFFFFFFFFFFFFFF)) - len(hex(v))
+        nn = countLeadingZeros(v)
         if debug is True:
             print(f"leading zeros    : {nn}")
         v <<= nn
         e = -1074 - nn
     else:
-        v = ((v << 11) | (1 << 63)) & ((1 << 64) - 1)
+        v = ((v << 11) | (1 << 63)) & u64_MASK
         e -= 1086;
 
     if debug is True:
@@ -388,31 +390,33 @@ def sqlite3FpDecode(r, iRound, mxRound, debug=False):
 
     # util.c line 1440
     i = SQLITE_U64_DIGITS
-    p.zBuf = ["0"]*SQLITE_U64_DIGITS
+    zBuf_ = ["0"]*SQLITE_U64_DIGITS
+    p = p._replace(zBuf=zBuf_)
     while v >= 10:
         # util.c line 1441: int kk = (v%100)*2
         kk = (v - int(v/100)*100) * 2
-        p.zBuf[i - 2:i] = sqlite3DigitPairs[kk:kk + 2]
+        zBuf_[i - 2:i] = sqlite3DigitPairs[kk:kk + 2]
         i -= 2
         v //= 100
     if v:
         if i <= 0: raise ValueError("assert (i>0)");
         i-=1                   # util.c line 1452
-        p.zBuf[i] = chr(ord('0') + v)
+        zBuf_[i] = chr(ord('0') + v)
     if debug is True:
-        zbuf = "".join(p.zBuf)
-        print(f"   sqlite3FpDecode: zBuf: {zbuf}")
+        zbuf_p = "".join(zBuf_)
+        print(f"   sqlite3FpDecode: zBuf: {zbuf_p}")
 
     # for practical reasons, convert to sequence of integers
-    p.zBuf = [int(digit) for digit in p.zBuf]
+    zBuf_ = [int(digit) for digit in zBuf_]
 
     n = SQLITE_U64_DIGITS - i  # util.c line 1456
-    p.iDP = n + exp            # util.c line 1459
+    iDP_ = n + exp            # util.c line 1459
+
     # util.c line 1460, iRound is never < 0, we use 17
     if iRound <= 0: raise ValueError("iRound <= 0")
     # create a read-only copy of zBuf starting at i
-    z = p.zBuf[i:]          # util.c line 1469: z = &zBuf[i]
-    z_ptr = i               # needed later for modifying zBuf
+    z = zBuf_[i:]          # util.c line 1469: z = &zBuf[i]
+    z_ptr = i              # needed later for modifying zBuf
     if ( iRound > 0 and (iRound < n or n > mxRound) ):
         if (iRound > mxRound): iRound = mxRound
         if iRound == 17:  # util.c line 1472
@@ -436,7 +440,7 @@ def sqlite3FpDecode(r, iRound, mxRound, debug=False):
                 if round_trip == r:
                     iRound = jj+1
             # util.c line 1492
-            elif (p.iDP>=n or (z[15]==0 and z[14]==0 and z[13]==0)):
+            elif (iDP_>=n or (z[15]==0 and z[14]==0 and z[13]==0)):
                 if z[0] == 0:
                     raise ValueError("assert( z[0]!='0'")
                 jj = 13
@@ -452,6 +456,7 @@ def sqlite3FpDecode(r, iRound, mxRound, debug=False):
             if debug == True:
                 print(f"   sqlite3FpDecode: iRound = {iRound}")
             n = iRound
+
             # from here on down the C code modifies zBuf (via z pointer)
             # in order to round the last digits. We modify zBuf and not our
             # read-only copy z, so we need to use (z_ptr + j) into zBuf
@@ -461,50 +466,61 @@ def sqlite3FpDecode(r, iRound, mxRound, debug=False):
                 j = iRound-1
                 while True:
                     # increment by one and check if we need roll-over
-                    p.zBuf[z_ptr+j] += 1
-                    if p.zBuf[z_ptr+j] <= 9:
+                    zBuf_[z_ptr+j] += 1
+                    if zBuf_[z_ptr+j] <= 9:
                         # no roll-over needed, break
                         break
                     # if we get here, we need roll-over
                     # implemented in line 1510 and down
-                    p.zBuf[z_ptr+j] = 0
+                    zBuf_[z_ptr+j] = 0
                     if j == 0:
                         z_ptr -= 1
-                        p.zBuf[z_ptr] = 1
+                        zBuf_[z_ptr] = 1
                         n+=1
-                        p.iDP+=1
+                        iDP_+=1
                         break
                     else:
                         j-=1
 
                 if debug is True:
-                    zbuf = "".join(str(val) for val in p.zBuf)
-                    print(f"   sqlite3FpDecode: zBuf: {zbuf}")
+                    zbuf_p = "".join(str(val) for val in zBuf_)
+                    print(f"   sqlite3FpDecode: zBuf: {zbuf_p}")
 
             if not n>0:
                 raise ValueError("assert (n>0)")
-            while p.zBuf[z_ptr+n-1] == 0:
+            while zBuf_[z_ptr+n-1] == 0:
                 n-=1
                 if not n>0:
                     raise ValueError("assert (n>0)")
 
-            p.n = n
-            p.z = z_ptr
+            p = p._replace(n=n,z=z_ptr)
+
+    # update the FpDecode object
+    p = p._replace(zBuf=zBuf_, iDP=iDP_)
 
     return p
 
 
 def sqlite3_str_vappendf(value, debug=False):
-    ''' minimal implementation to support etFLOAT '''
+    ''' minimal implementation of sqlite3_str_vappendf in printf.c 
+
+    Only the minimum to create text representation of floating point 
+    values is implemented.
+    '''
+
+    # we know that we arrive here with the following format string
+    # the format string %!.17g.
+    flag_altform2 = True
 
     # printf.c, line 555
     s = sqlite3FpDecode(value, 17, 20, debug)
 
     if s.isSpecial:
+        print(s.isSpecial)
         raise ValueError("TODO isSpecial")
 
     if s.sign == '-':
-        raise ValueError("TODO")
+        raise ValueError("TODO negative")
 
     # line 596, do we need this?
     # prefix = flag_prefix
