@@ -354,7 +354,7 @@ def sqlite3FpDecode(r, iRound, mxRound, debug=False):
 
     elif decoded_r == 0.0:
         # util.c, line 1402
-        p = p._replace(sign='+', n=1, iDP=1, z=0, zBuf=[0])
+        p = p._replace(sign='+', n=1, iDP=1, z=0, zBuf=['0'])
         return p
 
     else:
