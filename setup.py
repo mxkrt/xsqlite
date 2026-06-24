@@ -30,7 +30,6 @@ setup(
         },
     install_requires=[
         'bitstring',
-        'mpmath',
         'xlsxwriter',
         'modgrammar'
     ],
