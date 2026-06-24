@@ -1,15 +1,24 @@
 ''' _float_conversion - Python implementation of float related sqlite3 code
 
-SQLite3 takes extra care to make sure the text representation of an IEEE-754
-double preserves enough precision to be round-trip safe when importing the
-same text representation back into an SQLite3 database, while trying to keep
-the text representation as short/readable as possible.
+Floating point conversion is tricky, because floating point values are
+approximate and converting to TEXT and back may lead to differences depending
+on the format string used in the conversion.  SQLite takes special care to make
+sure that a conversion to TEXT and back to binary representation (IEEE 754
+Binary-64 format) is round-trip exact. For this, SQLite has implemented it's
+own version of printf. In older versions of SQLite this was implemented in
+sqlite3VXPrintf, in later versions the behaviour has changed and the code has
+moved to sqlite3_str_vapendf. This function exists in printf.c.
+
+See https://sqlite.org/floatingpoint.html for details.
 
 In order for our ".dump" implementation to behave in the same manner, we need
 to implement part of this logic in xsqlite. This source file contains part of
 the functions in printf.c and util.c that we use to mimic the floating point
 conversion behaviour. This is based on analysis of source version 3530200,
 downloaded from here: https://sqlite.org/2026/sqlite-src-3530200.zip
+
+Note that the output will likely be different when comparing to older
+versions of SQLite (prior to 3.52.0) where a different algorithm was used.
 '''
 
 import struct as _struct
@@ -530,7 +539,7 @@ def sqlite3_float_to_text(value, debug=False):
     values is implemented.
     '''
 
-    # we accept Python float  (64-bit) or bytes
+    # we accept Python float (64-bit) or bytes holding an IEEE-754 float
     if isinstance(value, float):
         value = _struct.pack('>d', value)
     elif isinstance(value, bytes):
@@ -539,10 +548,124 @@ def sqlite3_float_to_text(value, debug=False):
     else:
         raise ValueError("We expect either a float or bytes")
 
-    # we know that we arrive here with the following format string
-    # the format string %!.17g. So format string flag detection is
-    # skipped (printf.c, line 267) We can simply look at lines 392
-    # for the way the flags are initialized (we
+    # The sqlite3_str_vappendf function takes a format string and a list of
+    # arguments and in order to determine how the conversion is done for
+    # floating point numbers we need to track the function call throughout
+    # the source code. We start at the handling of the cli ".dump" command,
+    # since this is where all column values are converted to TEXT in order
+    # to include them in de SQL statements.
+    #
+    # We start in shell.c.in in the function do_meta_command. In the code
+    # responsiple for dealing with the ".dump" command, we see:
+    #
+    #    run_table_dump_query(p, zSql);
+    #
+    # Within this function we see for each row, the columns are converted to
+    # text with a call to this function, where i is the column index
+    #
+    #    cli_printf(p->out, ",%s", sqlite3_column_text(pSelect, i));
+    #
+    # The sqlite3_column_text is located in vdbeapi.c and in turn calls:
+    #
+    #    const unsigned char *val = sqlite3_value_text( columnMem(pStmt,i) );
+    #
+    # This function (within vdbeapi.c as well) is a wrapper for another
+    # function:
+    #
+    #    return (const unsigned char *)sqlite3ValueText(pVal, SQLITE_UTF8);
+    #
+    # This function in vdbemem.c checks some assumptions and tests if the
+    # value already is a valid string representation. If not, the following
+    # function is called to convert the value to text:
+    #
+    #    return valueToText(pVal, enc);
+    #
+    # Here, enc is SQLITE_UTF8 in the code-path we are analyzing. This
+    # function also is in vdbemem.c and starts again with some asserts to
+    # check the provided argument. Next, it is checked if the value is
+    # either BLOB or TEXT and it is dealth with accordingly. Finally, and
+    # the case we are interested in is when the type of value is different,
+    # in which case the following is called:
+    #
+    #    sqlite3VdbeMemStringify(pVal, enc, 0);
+    #
+    # This function, first checks if we are indeed dealing with Int, Real
+    # or IntReal, among other checks.
+    #
+    #    assert( pMem->flags&(MEM_Int|MEM_Real|MEM_IntReal) );
+    #
+    # The function then calls the following to convert the value to text:
+    #
+    #    vdbeMemRenderNum(nByte, pMem->z, pMem);
+    #
+    # This function, still in the same source file has the following
+    # comment:
+    #
+    #    Render a Mem object which is one of MEM_Int, MEM_Real, or
+    #    MEM_IntReal into a buffer.
+    #
+    # After some sanity checks and a workaround for a GCC bug, the
+    # following code is relevant for conversion of Int and IntReal
+    #
+    #    p->n = sqlite3Int64ToText(p->u.i, zBuf);
+    #
+    # However, we are interested in float, so we end up in the else
+    # statement where the following function is called:
+    #
+    #    sqlite3_str_appendf(&acc, "%!.*g",
+    #         (p->db ? p->db->nFpDigit : 17), p->u.r);
+    #
+    # Here we see that the function is called with nFpDigit or as a
+    # fallback the number 17. This number is used in place of the dot in
+    # the format string !.*g. Here the ! sets "flag_altform2" to True,
+    # which causes the sqlite3FpDecode function (see below) to use up to 20
+    # digits, which is needed to make sure we have a round-trip accurate
+    # conversion.
+    #
+    # This function is defined in printf.c and is a var-args wrapper for
+    # sqlite3_str_vapppend:
+    #
+    #    sqlite3_str_vappendf(p, zFormat, ap);
+    #
+    # This function (which is the replacement of sqlite3VXPrintf) is the
+    # actual work-horse of the format conversion. The conversion of floating
+    # point values is dealt with from line 528:
+    #
+    #   case etFLOAT:
+    #   case etEXP:
+    #   case etGENERIC: {
+    #
+    # In this part of the code, the realvalue is parsed from the argument list.
+    # The precision at this point is either nFpDigit or 17 when coming from the
+    # sqlite3_str_appendf function call displayed above. The default for
+    # nFpDigit (which seems to be available from version 3.52.0+) is 17, and it
+    # is a connection-specific runtime configuration variable, so we can
+    # probably assume 17 as the default value. We also know that we are dealing
+    # with case etGENERIC, due to the 'g' in the format string. Thus, the
+    # following part of the code is relevant for the precision:
+    #
+    #     }else if( xtype==etGENERIC ){
+    #       if( precision==0 ) precision = 1;
+    #       iRound = precision;
+    #
+    # So, for our partial implementation, we assume that iRound = 17 when the
+    # following function call occurs:
+    #
+    #  sqlite3FpDecode(&s, realvalue, iRound, flag_altform2 ? 20 : 16);
+    #
+    # The sqlite3FpDecode function exists in util.c and decodes a
+    # floating-point value into an approximate decimal representation. The
+    # docstring says the following about the iRound and mxRound argument:
+    #
+    # if iRound>0 round to min(iRound,mxRound) significant digits total.
+    #
+    # We know that iRound is 17 and mxRound is 20 (because flag_altform2 is
+    # enabled by '!' format string.
+    #
+    # Thus, we round to 17 significant digits.
+    #
+    # In summary: we know that we arrive here with the following format string
+    # the format string %!.17g, so we have altform2, precision 17 and etGENERIC
     flag_altform2 = True
     precision = 17
     xtype = etGENERIC
@@ -655,3 +778,148 @@ def sqlite3_float_to_text(value, debug=False):
             zOut+=f'e+{exp}'
 
     return zOut
+
+
+def _sqlite3VXPrintf(value, case=1):
+    ''' Format floating point value similar to the way this is performed by the
+    sqlite3VXPrintf function (in printf.c) as called (indirectly) from the
+    quoteFunc (in func.c). When case=1, the %.15g formatting is returned, when
+    case = 2, the %.20e formatting is returned.
+
+    We cannot just use the python equivalent of .15g or .20e, since we've seen
+    that the precision for the 'e' notation as produced by sqlite may differ.
+    Additionally, the rounding and removal of terminating zeroes works a bit
+    differently. In order to be able to verify our dumps with those produced by
+    the native sqlite3 command we need to port this stuff to python. Only the
+    bare minimum required for etGENERIC, etEXP and etFLOAT formatting (sqlite3
+    terminology) is ported.
+    '''
+
+    import mpmath as _mpmath
+    # we need 80 bit precision (TODO: do we need this?)
+    _mpmath.mp.prec = 80
+    # convert value to value with 80 bit precision
+    value = _mpmath.mpf(value)
+
+
+    # realvalue will be changed, keep value for normal .15g representation
+    realvalue = value
+
+    # some of the xtypes, just so we can use the same names here
+    etFLOAT = 2
+    etEXP = 3
+    etGENERIC = 4
+
+    if case == 1:
+        # precision of 15 is decremented in line 467 for etGENERIC
+        precision = 14
+        xtype = etGENERIC
+        precision -= 1
+
+    elif case == 2:
+        precision = 20
+        xtype = etEXP
+    else:
+        raise ValueError('case can be one of [1,2]')
+
+    # line 459, determine prefix
+    prefix = ''
+    if realvalue < 0.0:
+        realvalue = -realvalue
+        prefix = '-'
+
+    # line 472, NaN
+    if _math.isnan(realvalue):
+        return 'NaN'
+
+    # line 477, normalize to within (10.0, 1.0] range:
+    exp = 0
+    scale = 1.0
+    result = ''
+    # add prefix to result
+    result += prefix
+
+    # this seems to be updated in versions at higher than at least 3.8.7.1, on
+    # which the previous version was based. This I changed here, but the entire
+    # function needs revisiting, since I get rounding differences between the
+    # xsqlite export and the native export
+    if realvalue > 0.0:
+        while (realvalue >= 1e100 * scale and exp <= 350):
+            scale *= 1e100
+            exp += 100
+        while (realvalue >= 1e10 * scale and exp <= 350):
+            scale *= 1e10
+            exp += 10
+        while (realvalue >= 10.0 * scale and exp <= 350):
+            scale *= 10.0
+            exp += 1
+        realvalue /= scale
+        while realvalue < 1e-8:
+            realvalue *= 1e8
+            exp -= 8
+        while realvalue < 1.0:
+            realvalue *= 10.0
+            exp -= 1
+
+        if exp > 350:
+            result += 'Inf'
+            return result
+
+    # line 468, determine rounder
+    rounder = 0.5
+    for i in range(precision, 0, -1):
+        rounder *= 0.1
+
+    # line 503, convert etGENERIC to either etEXP or etFLOAT
+    realvalue += rounder
+    if realvalue >= 10.0:
+        realvalue *= 0.1
+        exp += 1
+
+    # line 507, determine xtype based on exponent and precision
+    if xtype == etGENERIC:
+        if (exp < -4 or exp > precision):
+            xtype = etEXP
+        else:
+            # at this point, everything is similar to python .15g formatting
+            result = '{:.15g}'.format(float(value))
+            # except for the additional .0 at the end
+            if '.' not in result:
+                result += '.0'
+            return result
+
+    # if we get here, xtype == etEXP, so no need to copy all checks
+
+    # line 537, digits prior to decimal point (and part at line 498)
+    # for etEXP this is always between 1 and 10, so e2 == 0
+    # (no need to implement loop as in sqlite3VXPrintf)
+    # add a digit and shift digits left (similar to et_getdigit)
+    digit = int(realvalue)
+    realvalue = (realvalue - digit) * 10
+    result += str(digit)
+    # line 545, decimal point (for etEXP always shown)
+    result += '.'
+
+    # line 555, significant digits after decimal point
+    while precision > 0:
+        precision -= 1
+        digit = int(realvalue)
+        realvalue = (realvalue - digit) * 10
+        result += str(digit)
+
+    # line 559, remove trailing zero's
+    result = result.rstrip('0')
+
+    # line 571, add the exponent with proper sign
+    result += 'e'
+    if exp < 0:
+        result += '-'
+        exp = -exp
+    else:
+        result += '+'
+    if exp >= 100:
+        result += '{:03d}'.format(exp)
+    else:
+        result += '{:02d}'.format(exp)
+
+    return result
