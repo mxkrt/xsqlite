@@ -54,7 +54,13 @@ sqlite3DigitPairs = "00010203040506070809" +\
 FpDecode_t = _nt('FpDecode', 'n iDP z zBuf sign isSpecial')
 
 
-def U64_BIT(n): 
+# printf.c, line 18, only three conversion types needed
+etFLOAT = 1
+etEXP = 2
+etGENERIC = 3
+
+
+def U64_BIT(n):
     ''' return a u64 with the N-th bit set '''
     return (1 << n)
 
@@ -351,7 +357,9 @@ def sqlite3FpDecode(r, iRound, mxRound, debug=False):
     if (e == 0x7ff):
         # this is either infinit or NaN
         # util.c line 1413
-        isSpecial = 1 + v != 0x7ff0000000000000
+        isSpecial = 1
+        if v != 0x7ff0000000000000:
+            isSpecial+=1
         p = p._replace(n=0, iDP=0, z=0, isSpecial=isSpecial)
         return p
 
@@ -493,41 +501,134 @@ def sqlite3FpDecode(r, iRound, mxRound, debug=False):
                 if not n>0:
                     raise ValueError("assert (n>0)")
 
-            p = p._replace(n=n,z=z_ptr)
-
+    # replace the digits with characters again
+    zBuf_ = [str(digit) for digit in zBuf_]
     # update the FpDecode object
-    p = p._replace(zBuf=zBuf_, iDP=iDP_)
+    p = p._replace(zBuf=zBuf_, iDP=iDP_,n=n,z=z_ptr)
 
     return p
 
 
 def sqlite3_str_vappendf(value, debug=False):
-    ''' minimal implementation of sqlite3_str_vappendf in printf.c 
+    ''' minimal implementation of sqlite3_str_vappendf in printf.c
 
-    Only the minimum to create text representation of floating point 
+    Only the minimum to create text representation of floating point
     values is implemented.
     '''
 
     # we know that we arrive here with the following format string
-    # the format string %!.17g.
+    # the format string %!.17g. So format string flag detection is
+    # skipped (printf.c, line 267) We can simply look at lines 392
+    # for the way the flags are initialized (we
     flag_altform2 = True
+    precision = 17
+    xtype = etGENERIC
+
+    # the switch-case statement in line 410 brings us all the way to
+    # line 530, since we have etGENERIC. Here we can skip further
+    # initialization of precision, since we know it is 17
+    # printf.c, line 551
+    iRound = precision
 
     # printf.c, line 555
-    s = sqlite3FpDecode(value, 17, 20, debug)
+    s = sqlite3FpDecode(value, iRound, 20, debug)
+    if debug is True:
+        print(f"<- sqlite3FpDecode: {s}")
 
-    if s.isSpecial:
-        print(s.isSpecial)
-        raise ValueError("TODO isSpecial")
+    # printf.c,line 558
+    if s.isSpecial==2:
+        return "NaN"
+    elif s.isSpecial==1:
+        # printf.c, line 566 - 573
+        if s.sign=='-':
+            return "-Inf"
+        else:
+            return "Inf"
 
+    # since flag_prefix is not set, we only have to set
+    # prefix when sign is negative (line 593)
+    prefix=''
     if s.sign == '-':
-        raise ValueError("TODO negative")
+        prefix='-'
 
-    # line 596, do we need this?
-    # prefix = flag_prefix
+    # line 599
     exp = s.iDP-1
 
-    # case etFLOAT
-    e2 = s.iDP -1
-    return s
+    # printf.c line 605, we know that the case is etGENERIC, so
+    # convert to etEXP or etFLOAT, as appropriate
 
+    # printf.c line 607
+    precision-=1
+    flag_rtz = True            # because flag_alternateform is False
+    if exp<-4 or exp>precision:
+        xtype = etEXP
+    else:
+        precision = precision - exp
+        xtype = etFLOAT
 
+    #printf.c line 618
+    if xtype==etEXP:
+        e2 = 0;
+    else:
+        e2 = s.iDP -1
+
+    # printf.c, line 646 is where a buffer is being initialized
+    # combine with line 651 to initialize with prefix
+    zOut = prefix
+
+    # printf.c, line 654
+    j = 0
+
+    # printf.c, line 654 - 674
+    if e2<0:
+        zOut+='0'
+    else:            # we do not need cThousand case
+        j = e2+1
+        if j>s.n:
+            j = s.n
+        # line 666, memcpy(bufpt, s.z, j)
+        zOut+=''.join(s.zBuf[s.z:s.z+j])
+        e2-=j
+        if e2>=0:
+            zOut+='0'*(e2+1)
+            e2 = -1
+
+    # printf.c, line 675, we always want decimal point (flag_altform2)
+    flag_dp = True
+    zOut+='.'
+
+    # printf.c, line 681
+    if e2 < -1 and precision>0:
+        nn = -1-e2
+        if nn > precision:
+            nn=precision
+        zOut+='0'
+        precision-=nn
+
+    # printf.c, line 689
+    if precision>0:
+        nn = s.n - j
+        # skip over line 691, it is always false due to NEVER
+        if nn>0:
+            zOut+= ''.join(s.zBuf[s.z+j:s.z+j+nn])
+            precision -= nn
+        # line 697, add trailing zero's according to precision
+        if precision>0:
+            zOut+= '0'*precision
+
+    # printf.c, line 703 remove trailing zero's
+    zOut = zOut.rstrip('0')
+    # printf.c, line 708, with altform2 we keep the
+    # decimal point and add a final zero
+    if zOut[-1]=='.':
+        zOut+='0'
+
+    # printf.c, line 715, Add the "eNNN" suffix
+    if xtype==etEXP:
+        exp = s.iDP - 1
+        if exp < 0:
+            zOut+=f'e-{exp}'
+        else:
+            zOut+=f'e+{exp}'
+
+    return zOut
