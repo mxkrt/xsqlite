@@ -78,11 +78,6 @@ and dependencies installed. It may or may not work under Windows.
   contains a critical bug for xsqlite. On debian based systems you can probably
   install with: apt install python3-bitstring, otherwise use pip3 install.
 
-* bigfloat package for proper handling of floating point formatting:
-  https://pypi.python.org/pypi/bigfloat/. The bigfloat module requires the
-  lbimpfr-dev package (apt install libmpfr-dev) after which you can install
-  bigfloat with pip3.
-
 * xlsxwriter for exporting records to Excel files:
   https://xlsxwriter.readthedocs.io/.
 
