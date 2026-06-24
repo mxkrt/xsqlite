@@ -22,6 +22,8 @@ from collections import namedtuple as _nt
 POWERSOF10_FIRST = -348
 POWERSOF10_LAST  = 347
 
+# unsigned 32-bit mask
+u32_MASK = ((1 << 32) - 1)
 # unsigned 64-bit mask
 u64_MASK = ((1 << 64) - 1)
 # unsigned 128-bit mask
@@ -80,12 +82,24 @@ def countLeadingZeros(m):
 
 def pwr2to10(p):
     ''' mimic pwr2to10 from util.c '''
-    return (p * 78913) >> 18
+
+    # util.c, line 727: return (p * 78913) >> 18
+    # assumption: int=32-bit signed integer
+    sign = 1 << (32-1)
+    x = (p * 78913) & u32_MASK
+    x = x - (1 << 32) if (x & sign) else x
+    return x >> 18
 
 
 def pwr10to2(p):
     ''' mimic prw10to2 from util.c '''
-    return (p * 108853) >> 15
+
+    # util.c, line 726: return (p * 108853) >> 15
+    # assumption: int=32-bit signed integer
+    sign = 1 << (32-1)
+    x = (p * 108853) & u32_MASK
+    x = x - (1 << 32) if (x & sign) else x
+    return x >> 15
 
 
 def sqlite3Multiply160(a, aLo, b, debug=False):
@@ -402,7 +416,7 @@ def sqlite3FpDecode(r, iRound, mxRound, debug=False):
     p = p._replace(zBuf=zBuf_)
     while v >= 10:
         # util.c line 1441: int kk = (v%100)*2
-        kk = (v - int(v/100)*100) * 2
+        kk = (v - int(v//100)*100) * 2
         zBuf_[i - 2:i] = sqlite3DigitPairs[kk:kk + 2]
         i -= 2
         v //= 100
@@ -509,12 +523,21 @@ def sqlite3FpDecode(r, iRound, mxRound, debug=False):
     return p
 
 
-def sqlite3_str_vappendf(value, debug=False):
+def sqlite3_float_to_text(value, debug=False):
     ''' minimal implementation of sqlite3_str_vappendf in printf.c
 
     Only the minimum to create text representation of floating point
     values is implemented.
     '''
+
+    # we accept Python float  (64-bit) or bytes
+    if isinstance(value, float):
+        value = _struct.pack('>d', value)
+    elif isinstance(value, bytes):
+        if len(value) != 8:
+            raise ValueError("We expect 8 bytes, IEEE 754 float")
+    else:
+        raise ValueError("We expect either a float or bytes")
 
     # we know that we arrive here with the following format string
     # the format string %!.17g. So format string flag detection is
