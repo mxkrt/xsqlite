@@ -703,6 +703,9 @@ def sqlite3_float_to_text(value, debug=False):
     # printf.c line 605, we know that the case is etGENERIC, so
     # convert to etEXP or etFLOAT, as appropriate
 
+    if precision <= 0:
+        raise ValueError("assert( precision>0 ) failed!")
+
     # printf.c line 607
     precision-=1
     flag_rtz = True            # because flag_alternateform is False
@@ -748,7 +751,8 @@ def sqlite3_float_to_text(value, debug=False):
         nn = -1-e2
         if nn > precision:
             nn=precision
-        zOut+='0'
+        # printf.c line 684: memset(bufpt, '0', nn)
+        zOut+='0'*nn
         precision-=nn
 
     # printf.c, line 689
@@ -773,7 +777,7 @@ def sqlite3_float_to_text(value, debug=False):
     if xtype==etEXP:
         exp = s.iDP - 1
         if exp < 0:
-            zOut+=f'e-{exp}'
+            zOut+=f'e-{-exp}'
         else:
             zOut+=f'e+{exp}'
 
