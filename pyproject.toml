@@ -1,0 +1,34 @@
+[project]
+name = 'xsqlite'
+version = '2.1.0'
+dependencies = [
+    'bitstring',
+    'xlsxwriter',
+    'modgrammar',
+    ]
+requires-python = '>=3.10'
+authors = [ {name = 'Netherlands Forensic Institute'},
+            {name = 'mxkrt', email = 'mxkrt@lsjam.nl'} ]
+description = 'SQLite database analysis and recovery tool'
+readme = 'README.md'
+keywords = ['forensic', 'database', 'sqlite', 'recovery']
+classifiers=[
+    'License :: OSI Approved :: MIT License',
+    'Development Status :: 5 - Production/Stable',
+    'Programming Language :: Python :: 3 :: Only',
+    'Intended Audience :: Science/Research',
+    'Topic :: Scientific/Engineering :: Information Analysis',
+    'Environment :: Console'
+]
+
+[tool.setuptools.package-data]
+'xsqlite' = ['VERSION']
+
+[tool.setuptools]
+packages = ['xsqlite']
+
+[project.scripts]
+xsqlite = 'xsqlite._cmdline:main'
+
+[project.urls]
+Repository = 'https://github.com/mxkrt/xsqlite'
