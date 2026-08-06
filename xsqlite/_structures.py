@@ -219,11 +219,18 @@ def _pagetype(number):
         raise ValueError('invalid b-tree page type {:d}'.format(number))
 
 
-def pageheader(btstr, offset, usablepagesize):
-    ''' Interprets bytes at offset as btree pageheader.
+def pageheader(data, offset, usablepagesize):
+    ''' Parse given bytes as btree pageheader
 
-    A btree_pageheader object contains the following fields:
+    Arguments:
 
+    - data           : bytes containing the btree pageheader
+    - offset         : offset of the btree pageheader structure
+    - usablepagesize : usable page size as calculated from database header
+
+    Returns:
+
+    - btree_pageheader : named tuple with the following fields:
         - pagetype: the type of b-tree page as defined in _pagetype
         - first_freeblock_offset: relative offset of the first freeblock.
         - cellcount: number of cells on this page.
@@ -233,14 +240,12 @@ def pageheader(btstr, offset, usablepagesize):
         - size: the size of the btree_pageheader
     '''
 
-    # move to header offset
-    storepos = btstr.bytepos
-    btstr.bytepos = offset
-
     # parse first 8 bytes
     hsize = 8
-    header = btstr.readlist('uint:8, uintbe:16, uintbe:16, uintbe:16, uint:8')
-    pgtype, first_freeblock, cellcount, cellarea, freebytes = header
+    fmt = '>BHHHB'
+    parsed = _unpack_from(fmt, data, offset)
+    pgtype, first_freeblock, cellcount, cellarea, freebytes = parsed
+
     # in some fields (including this one), value 0 means 65536
     if cellarea == 0:
         cellarea = 65536
@@ -250,11 +255,8 @@ def pageheader(btstr, offset, usablepagesize):
     # interior pages have a rightmost pointer
     rmp = None
     if pgtype in ['index_interior', 'table_interior']:
-        rmp = btstr.read('uintbe:32')
+        rmp = _unpack_from('>I', data, offset+hsize)[0]
         hsize += 4
-
-    # restore offset
-    btstr.bytepos = storepos
 
     if first_freeblock > usablepagesize:
         raise ValueError('first freeblock offset outside usable page area.')
@@ -299,10 +301,10 @@ def btree_page(btstr, offset, pagesize, usablepagesize, isheaderpage=False):
     hoffset = offset
     if isheaderpage is True:
         hoffset += 100
-    pgheader = pageheader(btstr, hoffset, usablepagesize)
+    pgheader = pageheader(bytes_, hoffset, usablepagesize)
 
     # parse the cell pointer area (directly after the pageheader)
-    cpa = cellpointer_area(btstr, hoffset + pgheader.size, pgheader.cellcount)
+    cpa = cellpointer_area(btstr.bytes, hoffset + pgheader.size, pgheader.cellcount)
 
     # parse the cells
     cells = [cell(btstr, bytes_, offset + cp, pgheader.pagetype,
@@ -347,24 +349,26 @@ _cellpointerarea = _nt('cellpointer_area',
                        'cellpointers size')
 
 
-def cellpointer_area(btstr, offset, cellcount):
-    ''' Interprets bytes at offset as cell pointer area with cellcount cells.
+def cellpointer_area(data, offset, cellcount):
+    ''' Parse given bytes as cellpointer area 
 
-    A cellpointer_area object contains the following fields:
+    Arguments:
 
+    - data      : bytes containing the database header
+    - offset    : offset of the dbheader structure
+    - cellcount : the total number of cells to parse
+
+    Returns: 
+    - cellpointer_area: namedtuple with the following fields:
         - cellpointers: a list of cell pointers
         - size: size of the cell pointer area
     '''
 
-    # store current position
-    oldpos = btstr.bytepos
-    btstr.bytepos = offset
     # parse proper amount of cell pointers
-    cpointers = btstr.readlist(cellcount * 'uintbe:16,')
+    fmt = '>' + 'H'*cellcount
+    cpointers = _unpack_from(fmt, data, offset)
     # cellpointer value 0 means 65536
     cpointers = [65536 if p == 0 else p for p in cpointers]
-    # restore position in btstr
-    btstr.bytepos = oldpos
     # cell pointer is two bytes wide
     cpa_size = cellcount * 2
     return _cellpointerarea(cpointers, cpa_size)
