@@ -96,7 +96,7 @@ class Database():
             raise ValueError('database appears to have a WAL and a journal file!')
 
         # parse the header at offset 0
-        s.header = _structures.dbheader(s.bitstream, offset=0)
+        s.header = _structures.dbheader(s.bitstream.bytes, offset=0)
 
         if hasattr(s, 'walfile'):
             if s.header.pagesize != s.walfile.pagesize:

@@ -6,6 +6,8 @@ The implementation of the structures and the logic is based on the description
 of the database format as given on: https://www.sqlite.org/fileformat.html
 '''
 
+from struct import unpack_from as _unpack_from
+
 from collections import namedtuple as _nt
 from bitstring import BitStream as _BS
 
@@ -22,51 +24,24 @@ _dbheader = _nt('database_header', 'headerstring pagesize writeversion '
                 'dbsize firstfreelisttrunkpage totalfreelistpages '
                 'schemacookie schemaformat defaultpagecachesize '
                 'largestrootbtreepage textencoding userversion '
-                'vacuummode reserved validfor version '
+                'vacuummode applicationID reserved validfor version '
                 'usablepagesize externalsize inheadersizevalid')
 
 
-def dbheader(btstr, offset=0):
-    ''' Parses the database header at given offset in bitstream.
+def dbheader(data, offset=0):
+    ''' Parse given bytes as database header
 
-    A database_header contains the following fields:
+    Arguments:
 
-        - headerstring: The header string 'SQLite format 3[0x00]'
-        - pagesize: The database page size in bytes. Size 1 means 65536
-        - writeversion: file format write version. 1 for legacy; 2 for WAL.
-        - readversion: file format read version. 1 for legacy; 2 for WAL.
-        - reservedspace: Bytes of unused "reserved" space at the end of
-           each page. Usually 0.
-        - maxpayloadfraction: maximum embedded payload fraction
-        - minpayloadfraction: minimum embedded payload fraction
-        - leafpayloadfraction: Leaf payload fraction
-        - filechangecounter: File change counter. Note: the change counter
-           might not be incremented on each transaction in WAL mode.
-        - dbsize: Size of the database file in pages, a.k.a. the "in-header
-          database size"
-        - firstfreelisttrunkpage: Page number of the first freelist trunk page.
-        - totalfreelistpages: Total number of freelist pages.
-        - schemacookie: The schema cookie.
-        - schemaformat: The schema format number.
-        - defaultpagecachesize: Default page cache size.
-        - largestrootbtreepage: The page number of the largest root b-tree page
-           when in auto- or incremental vacuum mode, zero otherwise.
-        - textencoding: The database text encoding.
-        - userversion: The "user version" as read and set by the user_version
-           pragma. Not used by SQLite internally.
-        - vacuummode: True (non-zero) for incremental-vacuum mode.  False
-           (zero) otherwise.
-        - reserved: 24 bytes reserved for expansion. Must be zero.
-        - validfor: The version-valid-for number (?)
-        - version: SQLITE_VERSION_NUMBER field (?)
-        - usablepagesize: calculated usable page size
-        - externalsize: calculated size of database in pages based on bitstream
-           size (may be wrong if only sub bitstream was passed into function).
-        - inheadersizevalid: indicates if in-header database size is valid
+    - data     : bytes containing the database header
+    - offset   : offset of the dbheader structure
+
+    Returns:
+
+    - dbheader : named tuple with the parsed database header
     '''
 
-    # the encoding of the database
-
+    # map encoding numbers to human-readable encoding string
     # Note: while only the encodings 1 through 3 are allowed per the
     # documentation on the sqlite3 website. We have found several
     # databases with encoding 0. After some searching through the
@@ -75,47 +50,80 @@ def dbheader(btstr, offset=0):
     # 109621       if( encoding==0 ) encoding = SQLITE_UTF8;
     #
     # Thus, an encoding of 0 is also allowed and indicates UTF8
-
     _encoding = {0: 'utf-8',
                  1: 'utf-8',
                  2: 'utf-16le',
                  3: 'utf-16be'}
 
-    # remember current position and read the bytes
-    storepos = btstr.bytepos
-    btstr.bytepos = offset
-    headerstring = btstr.read('bytes:16').decode('utf-8')
-    pagesize = btstr.read('uintbe:16')
-    # pagesize 1 is a special value indicating pagesize 65536
+    # headerstring: The header string 'SQLite format 3[0x00]'
+    headerstring = data[offset:offset+16].decode('utf-8')
+
+    # parse the fields between header string and reserved area
+    fmt = '>H' + 'B'*6 + 'I'*12
+    parsed = _unpack_from(fmt, data, 16)
+    # pagesize: The database page size in bytes. Size 1 means 65536
+    pagesize = parsed[0]
     if pagesize == 1:
         pagesize = 65536
-    writeversion, readversion = btstr.readlist('uint:8, uint:8')
-    reservedspace = btstr.read('uint:8')
-    maxpayloadfraction = btstr.read('uint:8')
-    minpayloadfraction = btstr.read('uint:8')
-    leafpayloadfraction = btstr.read('uint:8')
-    filechangecounter = btstr.read('uintbe:32')
-    dbsize = btstr.read('uintbe:32')
-    firstfreelisttrunkpage = btstr.read('uintbe:32')
-    totalfreelistpages = btstr.read('uintbe:32')
-    schemacookie = btstr.read('uintbe:32')
-    schemaformat = btstr.read('uintbe:32')
-    defaultpagecachesize = btstr.read('uintbe:32')
-    largestrootbtreepage = btstr.read('uintbe:32')
-    textencoding = _encoding[btstr.read('uintbe:32')]
-    userversion = btstr.read('uintbe:32')
-    vacuummode = bool(btstr.read('uintbe:32'))
-    reserved = btstr.read('uintbe:192')
-    validfor = btstr.read('uintbe:32')
-    version = btstr.read('uintbe:32')
-    # after reading, reset pointer
-    btstr.bytepos = storepos
+    # writeversion: file format write version. 1 for legacy; 2 for WAL.
+    writeversion = parsed[1]
+    # readversion: file format read version. 1 for legacy; 2 for WAL.
+    readversion = parsed[2]
+    # reservedspace: Bytes of unused "reserved" space at the end of
+    # each page. Usually 0.
+    reservedspace = parsed[3]
+    # maxpayloadfraction: maximum embedded payload fraction.
+    maxpayloadfraction = parsed[4]
+    # minpayloadfraction: minimum embedded payload fraction.
+    minpayloadfraction = parsed[5]
+    # leafpayloadfraction: Leaf payload fraction.
+    leafpayloadfraction = parsed[6]
+    # filechangecounter: File change counter. Note: the change counter
+    # might not be incremented on each transaction in WAL mode.
+    filechangecounter = parsed[7]
+    # dbsize: Size of the database file in pages, a.k.a. the "in-header
+    # database size".
+    dbsize = parsed[8]
+    # firstfreelisttrunkpage: Page number of the first freelist trunk page.
+    firstfreelisttrunkpage = parsed[9]
+    # totalfreelistpages: Total number of freelist pages.
+    totalfreelistpages = parsed[10]
+    # schemacookie: The schema cookie.
+    schemacookie = parsed[11]
+    # schemaformat: The schema format number.
+    schemaformat = parsed[12]
+    # defaultpagecachesize: Default page cache size.
+    defaultpagecachesize = parsed[13]
+    # largestrootbtreepage: The page number of the largest root b-tree page
+    # when in auto- or incremental vacuum mode, zero otherwise.
+    largestrootbtreepage = parsed[14]
+    # textencoding: The database text encoding.
+    textencoding = _encoding[parsed[15]]
+    # userversion: The "user version" as read and set by the user_version
+    # pragma. Not used by SQLite internally.
+    userversion = parsed[16]
+    # vacuummode: True (non-zero) for incremental-vacuum mode.  False
+    # (zero) otherwise.
+    vacuummode = bool(parsed[17])
+    # "Application ID" set by PRAGMA application_id.
+    applicationID = parsed[18]
 
-    # define calculated properties
+    # reserved: 20 bytes reserved for expansion. Must be zero.
+    reserved = int.from_bytes(data[72:92], byteorder='big', signed=False)
+
+    # parse the remaining fields
+    fmt = '>II'
+    # validfor: The version-valid-for number
+    # version: SQLITE_VERSION_NUMBER field
+    validfor, version = _unpack_from(fmt, data, 92)
+
+    # usablepagesize: calculated usable page size
     usablepagesize = pagesize - reservedspace
-    # NOTE: externalsize may be wrong if only a sub bitstream was passed
-    externalsize = int(btstr.length / 8 / pagesize)
+    # externalsize: calculated size of database in pages based on bitstream
+    # size (may be wrong if only part of th data was passed into function).
+    externalsize = int(len(data) / pagesize)
 
+    # inheadersizevalid: indicates if in-header database size is valid
     # The 'in header database size' is only valid if it is nonzero
     # and if the filechange counter matches the validfor number.
     inheadersizevalid = True
@@ -160,7 +168,7 @@ def dbheader(btstr, offset=0):
     # Also note that the schemaformat is not used in any way in the rest of
     # xsqlite's parsing and interpretation.
     if schemaformat not in [0, 1, 2, 3, 4]:
-        raise ValueError('Supported schema formats are 1,2,3,4')
+        raise ValueError('Supported schema formats are 0,1,2,3,4')
     if reserved != 0:
         raise ValueError('Space used for expansion should be zero.')
     if externalsize % 1 != 0:
@@ -172,8 +180,8 @@ def dbheader(btstr, offset=0):
                      filechangecounter, dbsize, firstfreelisttrunkpage,
                      totalfreelistpages, schemacookie, schemaformat,
                      defaultpagecachesize, largestrootbtreepage,
-                     textencoding, userversion, vacuummode, reserved,
-                     validfor, version, usablepagesize,
+                     textencoding, userversion, vacuummode, applicationID,
+                     reserved, validfor, version, usablepagesize,
                      externalsize, inheadersizevalid)
 
 
