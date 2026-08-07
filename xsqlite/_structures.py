@@ -1185,8 +1185,8 @@ _wal_frame_header = _nt('wal_frame_header', 'pagenumber commit_page_count salt1 
                                             'checksum1 checksum2')
 
 
-def walframeheader(btstr, offset=0):
-    ''' Parses the WAL frame header at given offset in bitstream.
+def walframeheader(data, offset=0):
+    ''' Parses given data as WAL frame header
 
     A walheader contains the following fields:
 
@@ -1199,18 +1199,14 @@ def walframeheader(btstr, offset=0):
         - checksum2: Second half of the cumulative checksum
     '''
 
-    # remember current position and read the bytes
-    storepos = btstr.bytepos
-    btstr.bytepos = offset
+    fmt = '>IIIIII'
+    parsed = _unpack_from(fmt, data, offset)
 
-    pagenumber = btstr.read('uintbe:32')
-    commit_page_count = btstr.read('uintbe:32')
-    salt1 = btstr.read('uintbe:32')
-    salt2 = btstr.read('uintbe:32')
-    checksum1 = btstr.read('uintbe:32')
-    checksum2 = btstr.read('uintbe:32')
-
-    # after reading, reset pointer
-    btstr.bytepos = storepos
+    pagenumber = parsed[0]
+    commit_page_count = parsed[1]
+    salt1 = parsed[2]
+    salt2 = parsed[3]
+    checksum1 = parsed[4]
+    checksum2 = parsed[5]
 
     return _wal_frame_header(pagenumber, commit_page_count, salt1, salt2, checksum1, checksum2)
