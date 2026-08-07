@@ -1110,29 +1110,32 @@ def _walchecksum(integers, s0=0, s1=0):
     return s0, s1
 
 
-def walheader(btstr, offset=0):
-    ''' Parses the WAL header at given offset in bitstream.
-
-    A walheader contains the following fields:
-
-        - magic: magic number Magic number. 0x377f0682 or 0x377f0683
-        - file_format_version: File format version. Currently 3007000
-        - pagesize: Database page size. Example: 1024
-        - checkpoint_sequence: Checkpoint sequence number
-        - salt1: random integer incremented with each checkpoint
-        - salt2: a different random number for each checkpoint
-        - checksum1: First part of a checksum on the first 24 bytes of header
-        - checksum2: Second part of the checksum on the first 24 bytes of header
-        - endianness: the endianness used in checksum computation
+def walheader(data, offset=0):
+    ''' Parses given bytes as WAL header
     '''
 
-    # remember current position and read the bytes
-    storepos = btstr.bytepos
-    btstr.bytepos = offset
-    magic = btstr.read('uintbe:32')
+    fmt = '>IIIIIIII'
+    parsed = _unpack_from(fmt, data, offset)
+
+    # Magic number. 0x377f0682 or 0x377f0683
+    magic = parsed[0]
+    # File format version. Currently 3007000
+    file_format_version = parsed[1]
+    # Database page size. Example: 1024
+    pagesize = parsed[2]
+    # Checkpoint sequence number
+    checkpoint_sequence_number = parsed[3]
+    # Random integer incremented with each checkpoint
+    salt1 = parsed[4]
+    # Different random number for each checkpoint
+    salt2 = parsed[5]
+    # checksum1: First part of a checksum on the first 24 bytes of header
+    checksum1 = parsed[6]
+    # checksum2: Second part of the checksum on the first 24 bytes of header
+    checksum2 = parsed[7]
 
     # the endianness is only used in the checksum computation, the
-    # values in the header are still
+    # values in the header are still big endian
     if magic == 0x377f0683:
         endianness = 'big'
     elif magic == 0x377f0682:
@@ -1140,41 +1143,24 @@ def walheader(btstr, offset=0):
     else:
         raise ValueError('unknown magic value encountered in WAL file')
 
-    # compute the checksums
-    btstr.bytepos = offset
-    if endianness == 'little':
-        integers = btstr.readlist(['uintle:32'] * 6)
-    if endianness == 'big':
-        integers = btstr.readlist(['uintbe:32'] * 6)
-
-    calc_checksum1, calc_checksum2 = _walchecksum(integers)
-
-    # move back to the position directy after the magic
-    btstr.bytepos = offset + 4
-    file_format_version = btstr.read('uintbe:32')
-
     if file_format_version != 3007000:
         raise ValueError('unexpected file format version in WAL file')
-
-    pagesize = btstr.read('uintbe:32')
 
     if pagesize not in [2**i for i in range(9,17)]:
         raise ValueError('pagesize is not a power of two between 512 and 65536 inclusive')
 
-    checkpoint_sequence_number = btstr.read('uintbe:32')
-    salt1 = btstr.read('uintbe:32')
-    salt2 = btstr.read('uintbe:32')
-    checksum1 = btstr.read('uintbe:32')
-    checksum2 = btstr.read('uintbe:32')
+    # calculate the checksum according to endianess
+    if endianness == 'little':
+        integers = _unpack_from('<IIIIII', data, 0)
+    if endianness == 'big':
+        integers = _unpack_from('>IIIIII', data, 0)
+    calc_checksum1, calc_checksum2 = _walchecksum(integers)
 
     # validation
     if calc_checksum1 != checksum1:
         raise ValueError('checksum1 in WAL header is incorrect')
     if calc_checksum2 != checksum2:
         raise ValueError('checksum2 in WAL header is incorrect')
-
-    # after reading, reset pointer
-    btstr.bytepos = storepos
 
     return _walheader(magic, file_format_version, pagesize,
                       checkpoint_sequence_number, salt1,
