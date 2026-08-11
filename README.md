@@ -73,11 +73,6 @@ and dependencies installed. It may or may not work under Windows.
 
 * Python3
 
-* bitstring for all binary file interaction:
-  https://pypi.python.org/pypi/bitstring/3.1.3. Note that version < 3.1.2
-  contains a critical bug for xsqlite. On debian based systems you can probably
-  install with: apt install python3-bitstring, otherwise use pip3 install.
-
 * xlsxwriter for exporting records to Excel files:
   https://xlsxwriter.readthedocs.io/.
 
@@ -105,4 +100,5 @@ Several commercial tools also exist.
 
 ## License
 
-Copyright (C) 2022 Netherlands Forensic Institute - MIT License
+Copyright (c) 2014-2026 Netherlands Forensic Institute - MIT License
+Copyright (c) 2025-2026 mxkrt@lsjam.nl - MIT License
