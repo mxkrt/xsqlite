@@ -51,6 +51,7 @@ from collections import namedtuple as _nt
 # - inheadersizevalid: indicates if in-header database size is valid
 #   The 'in header database size' is only valid if it is nonzero
 #   and if the filechange counter matches the validfor number.
+# - size: the size of the database header
 _dbheader = _nt('database_header', 'headerstring pagesize writeversion '
                 'readversion reservedspace maxpayloadfraction '
                 'minpayloadfraction leafpayloadfraction filechangecounter '
@@ -58,7 +59,7 @@ _dbheader = _nt('database_header', 'headerstring pagesize writeversion '
                 'schemacookie schemaformat defaultpagecachesize '
                 'largestrootbtreepage textencoding userversion '
                 'vacuummode applicationID reserved validfor version '
-                'usablepagesize externalsize inheadersizevalid')
+                'usablepagesize externalsize inheadersizevalid size')
 
 
 # map encoding numbers to human-readable encoding string
@@ -86,6 +87,9 @@ def dbheader(data, offset=0):
     Returns:
     - dbheader : namedtuple with the parsed database header
     '''
+
+    # database header is 100 bytes
+    hsize = 100
 
     # parse bytes according to Database Header Format
     fmt = '>16sH' + 'B'*6 + 'I'*12 + '20sII'
@@ -173,7 +177,7 @@ def dbheader(data, offset=0):
                      defaultpagecachesize, largestrootbtreepage,
                      textencoding, userversion, vacuummode, applicationID,
                      reserved, validfor, version, usablepagesize,
-                     externalsize, inheadersizevalid)
+                     externalsize, inheadersizevalid, hsize)
 
 
 ##############
@@ -193,29 +197,15 @@ _pageheader = _nt('btree_pageheader',
                   'cell_content_offset fragmented_freebyte_count '
                   'rightmost_pointer size')
 
-
-def _pagetype(number):
-    ''' Returns pagetype name for given pagetype number.
-
-    There are four b-tree pagetypes defined:
-
-        - table_interior : A table b-tree interior page
-        - table_leaf     : A table b-tree leaf page
-        - index_interior : An index b-tree interior page
-        - index_leaf     : An index b-tree leaf page
-    '''
-
-    typemap = {
-        2: 'index_interior',
-        5: 'table_interior',
-        10: 'index_leaf',
-        13: 'table_leaf'
-        }
-
-    if number in typemap:
-        return typemap[number]
-    else:
-        raise ValueError('invalid b-tree page type {:d}'.format(number))
+# There are four b-tree pagetypes defined:
+# - table_interior : A table b-tree interior page
+# - table_leaf     : A table b-tree leaf page
+# - index_interior : An index b-tree interior page
+# - index_leaf     : An index b-tree leaf page
+_pagetype = {2: 'index_interior',
+             5: 'table_interior',
+             10: 'index_leaf',
+             13: 'table_leaf'}
 
 
 def pageheader(data, offset, usablepagesize):
@@ -239,8 +229,12 @@ def pageheader(data, offset, usablepagesize):
     # in some fields (including this one), value 0 means 65536
     if cellarea == 0:
         cellarea = 65536
+
     # replace parsed values with interpreted values
-    pgtype = _pagetype(pgtype)
+    if pgtype in _pagetype:
+        pgtype = _pagetype[pgtype]
+    else:
+        raise ValueError('invalid b-tree page type {:d}'.format(pgtype))
 
     # interior pages have a rightmost pointer
     rmp = None
@@ -455,9 +449,9 @@ def _inline_payload_size(celltype, payloadsize, usablepagesize):
     # --> this is same as int() in Python
     M = int(((U - 12) * 32 / 255) - 23)   # (minLocal and minLeaf)
 
-    if celltype is 'table':
+    if celltype == 'table':
         X = U - 35                           # (maxLeaf)
-    elif celltype is 'index':
+    elif celltype == 'index':
         # see note on rounding above
         X = int(((U - 12) * 64 / 255) - 23)  # (maxLocal)
 
