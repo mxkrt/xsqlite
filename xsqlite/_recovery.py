@@ -6,6 +6,7 @@ Copyright (c) 2022 Netherlands Forensic Institute - MIT License
 from collections import namedtuple as _nt
 from collections import OrderedDict as _OD
 from collections import Counter as _Counter
+from struct import pack as _pack
 import statistics as _statistics
 from enum import Enum as _Enum
 import bitstring as _bitstring
@@ -14,7 +15,6 @@ from itertools import chain as _chain
 
 from . import _structures
 from . import _exceptions
-from . import _block
 from . import _export
 from . import _database
 
@@ -226,8 +226,7 @@ def determine_recovery_parameters(db, tablename, minimal_record_count=30, ignore
     # make sure we only have to create these size varints once
     headersizes = _OD()
     for size in range(min_headersize, max_headersize + 1):
-        varint = _structures.tovarint(size)
-        headersizes[size] = (varint, varint.bytes)
+        headersizes[size] = _structures.tovarint(size)
 
     # the recordheader can contain 1 varint for each column + headersize
     max_varints_in_header = len(tbl.columns) + 1
@@ -237,10 +236,10 @@ def determine_recovery_parameters(db, tablename, minimal_record_count=30, ignore
     if tbl.ipk_col == 0:
         # if col0 is the INTEGER PRIMARY KEY column, then the only allowed value is 0
         # which significantly speeds up recordheader reconstruction
-        prepend_col0 = [_bitstring.BitStream(uint=0, length=8)]
+        prepend_col0 = [_pack('>b', 0)]
     else:
         # otherwise, we can not be sure and we need to try them all.
-        prepend_col0 = [_bitstring.BitStream(uint=i, length=8) for i in range(0, 256) if i != 128]
+        prepend_col0 = [_pack('>b', i) for i in range(0, 256) if i != 128]
 
     max_nr_of_cols = len(tbl.columns)
 
@@ -340,13 +339,15 @@ class Freeblock():
     def __init__(s, parsed_freeblock, pagenumber=None, pageoffset=None, pagesource=None):
         ''' initialize Freeblock object, optionally setting pagenumber and pageoffset '''
 
+        raise ValueError("TODO: freeblock now has relative offset!")
+
         s.next_freeblock = parsed_freeblock.next_freeblock
         s.header_offset = parsed_freeblock.offset
         s.data_offset = s.header_offset + 4
         s.size = parsed_freeblock.size
         s.data_size = s.size - 4
         # this is the data *after* the 4 byte freeblock header
-        s.data = parsed_freeblock.block.data()
+        s.data = parsed_freeblock.block
         s.pageoffset = pageoffset
         s.pagenumber = pagenumber
         s.pagesource = pagesource
@@ -397,7 +398,7 @@ class AllocatedCell():
         s.data_offset = cell.parsed_cell.inline_payload.offset
 
         # combine the data blocks into a single bitstream (collects overflow as well)
-        s.data = _block.allblocklistdata(cell.payload.blocklist)
+        s.data = b''.join(c.payload.blocklist)
 
         # The header holds the payloadsize and the rowid in varints, so it's
         # size needs to be determined. Without overflow, we can determine the
@@ -1019,7 +1020,7 @@ def _varint_cache(bytes_):
     # we would parse the bytes at the given offset as a sequence of n varints
     # directly. Thus, each cache hit will yield the correct sequence of varints
 
-    # length of bitstring in bytes
+    # length of data
     length = len(bytes_)
 
     # parsing everything as varints will fail if the last bytes have their
@@ -1256,7 +1257,7 @@ def _scan_btree_for_varints(db, rootpagenumber, varint_count):
     '''
 
     for free_area in _freespace_walker(db, rootpagenumber):
-        for offset, varints, stypes in _varint_scanner(free_area.data.bytes, varint_count):
+        for offset, varints, stypes in _varint_scanner(free_area.data, varint_count):
             yield free_area, offset, varints, stypes
 
 
@@ -1467,7 +1468,7 @@ def _scan_wal_slack_for_varints(db, varint_count):
     ''' scan through the wal slack varints '''
 
     slackdata = db.walfile.slack
-    pageoffset = db.walfile.slack.offset
+    pageoffset = db.walfile.slack_offset
     pagesource = _database.PageSource.WALFile
 
     # treat as a single unallocated area and scan for varint sequences
@@ -2009,7 +2010,7 @@ def _header_sequences(candidate, recovery_parameters):
         subdata = dslice[1]
 
         for hdrsize in allowed_sizes:
-            prepend = recovery_parameters.possible_headersizes[hdrsize][1]
+            prepend = recovery_parameters.possible_headersizes[hdrsize]
 
             try:
                 # we know that the hdrsize is valid, no need to parse separately
@@ -2028,7 +2029,7 @@ def _header_sequences(candidate, recovery_parameters):
             # Now, for each added hdrsize, try to parse the bytes as a recordheader by
             # inserting every possible value for the first varint byte
             for p in col0_allowed_prepend[extra_bytes]:
-                prepend = recovery_parameters.possible_headersizes[hdrsize][1] + p.bytes
+                prepend = recovery_parameters.possible_headersizes[hdrsize] + p.bytes
                 newdata = prepend+subdata
                 try:
                     # if we get here, we can try to parse the entire sequence
@@ -2421,8 +2422,8 @@ class RecoveredRecord:
         if s.recheader_prepended_bytes is not None:
             bytes_ = s.recheader_prepended_bytes + bytes_
 
-        s.reconstructed_data = _bitstring.BitStream(bytes_)
-        s.reconstructed_data_size = len(s.reconstructed_data)//8
+        s.reconstructed_data = bytes_
+        s.reconstructed_data_size = len(s.reconstructed_data);
 
         # and attempt to reconstruct a record from it
         s._reconstruct_record()
