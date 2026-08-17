@@ -9,7 +9,7 @@ from collections import Counter as _Counter
 from struct import pack as _pack
 import statistics as _statistics
 from enum import Enum as _Enum
-import bitstring as _bitstring
+#import bitstring as _bitstring
 import re as _re
 from itertools import chain as _chain
 
