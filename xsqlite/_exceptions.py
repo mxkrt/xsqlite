@@ -1,6 +1,7 @@
 ''' _exceptions.py - module specific exceptions
 
-Copyright (c) 2022 Netherlands Forensic Institute - MIT License
+Copyright (c) 2014-2026 Netherlands Forensic Institute - MIT License
+Copyright (c) 2025-2026 mxkrt@lsjam.nl - MIT License
 '''
 
 class InvalidArgumentException(Exception):

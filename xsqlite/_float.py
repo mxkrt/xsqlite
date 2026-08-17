@@ -1,5 +1,8 @@
 ''' _float_conversion - Python implementation of float related sqlite3 code
 
+Copyright (c) 2014-2026 Netherlands Forensic Institute - MIT License
+Copyright (c) 2025-2026 mxkrt@lsjam.nl - MIT License
+
 Floating point conversion is tricky, because floating point values are
 approximate and converting to TEXT and back may lead to differences depending
 on the format string used in the conversion.  SQLite takes special care to make

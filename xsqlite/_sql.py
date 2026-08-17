@@ -1,6 +1,7 @@
 ''' _sql.py - Functionality to parse a subset of SQLite's SQL language.
 
-Copyright (c) 2022 Netherlands Forensic Institute - MIT License
+Copyright (c) 2014-2026 Netherlands Forensic Institute - MIT License
+Copyright (c) 2025-2026 mxkrt@lsjam.nl - MIT License
 
 Only the subset needed to accurately parse the CREATE TABLE statement is
 implemented at the moment. This is needed for parsing the sql statements in
