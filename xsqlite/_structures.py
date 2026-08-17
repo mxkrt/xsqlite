@@ -51,7 +51,7 @@ from collections import namedtuple as _nt
 # - inheadersizevalid: indicates if in-header database size is valid
 #   The 'in header database size' is only valid if it is nonzero
 #   and if the filechange counter matches the validfor number.
-# - size: the size of the database header
+# - size: the size of the database header (100)
 _dbheader = _nt('database_header', 'headerstring pagesize writeversion '
                 'readversion reservedspace maxpayloadfraction '
                 'minpayloadfraction leafpayloadfraction filechangecounter '
@@ -267,17 +267,15 @@ def pageheader(data, offset, usablepagesize):
 # - rowidmap: {rowid:cellnumber} for table_leaf pages, None otherwise
 # - freeblocks: a list of freeblocks for this page
 # - unallocated_offset: relative offset of the unallocated space
-# - unallocated: the data stored in the unallocated area for this page
-# - unallocated_size : size of the unallocated space
 # - reserved_offset: relative offset of the reserved area (usablepagesize)
-# - reserved: the data stored in the reserved area for this page or None
 # - size: the page size (passed in as variable)
+# - unallocated: the data stored in the unallocated area for this page
+# - reserved: the data stored in the reserved area for this page or None
 _btreepage = _nt('btree_page', 'pagetype header_offset header '
                                'cellpointer_offset cellpointer_area '
                                'cells rowidmap freeblocks '
-                               'unallocated_offset unallocated_data '
-                               'unallocated_size '
-                               'reserved_offset reserved_data size')
+                               'unallocated_offset reserved_offset size '
+                               'unallocated reserved')
 
 
 def btree_page(data, offset, pagesize, usablepagesize, isheaderpage=False):
@@ -340,9 +338,9 @@ def btree_page(data, offset, pagesize, usablepagesize, isheaderpage=False):
         # make the offsets relative to page offset before returning
         res_offset = res_offset - offset
 
-    return _btreepage(pgheader.pagetype, hoffset-offset, pgheader, cpa_offset, cpa, cells,
-                      rowidmap, fblocks, uoffset, unalloc, usize, res_offset, res,
-                      pagesize)
+    return _btreepage(pgheader.pagetype, hoffset-offset, pgheader, cpa_offset, 
+                      cpa, cells, rowidmap, fblocks, uoffset, res_offset, pagesize,
+                      unalloc, res)
 
 
 ####################
@@ -386,14 +384,14 @@ def cell(data, page_offset, cell_offset, pagetype, usablepagesize):
     ''' Parse given bytes as cell, depending of pagetype
 
     Arguments:
-    - data           : bytes containing the cell
+    - data           : bytes containing the page that holds the cell
     - page_offset    : offset of the page holding the cell structure
     - cell_offset    : relative offset of the cell within the page
     - pagetype       : string indicating the type of page (and thus cell type)
     - usablepagesize : offset of reserved area within page
 
     Returns:
-    - cell           : parsed cell, depending of pagetype
+    - cell           : parsed cell, depending on pagetype
     '''
 
     # cell structure varies for different page types
@@ -472,15 +470,14 @@ def _inline_payload_size(celltype, payloadsize, usablepagesize):
 # - payloadsize: total payload size, including overflow (if any)
 # - rowid: rowid of record stored in the cell
 # - first_overflow_page: page number of first overflow page
-# - inline_payload: the data stored as inline payload
-# - inline_payload_size: size of the inline payload
+# - cell_offset: relative offset of the cell within the page (passed as arg)
 # - inline_payload_offset: relative offset of the inline payload within the page
-# - cell_offset: relative offset of the cell within the page
 # - cell_size: total size of the cell (payload_size + headersize)
+# - inline_payload: the data stored as inline payload
 _table_leaf_cell = _nt('table_leaf_cell',
-                       'payloadsize rowid first_overflow_page inline_payload '
-                       'inline_payload_size inline_payload_offset cell_offset '
-                       'cell_size')
+                       'payloadsize rowid first_overflow_page '
+                       'cell_offset inline_payload_offset cell_size '
+                       'inline_payload')
 
 
 def _tableleaf_cell(data, page_offset, cell_offset, usablepagesize):
@@ -509,6 +506,8 @@ def _tableleaf_cell(data, page_offset, cell_offset, usablepagesize):
     ipstart = payloadstart + offset
     ipend = ipstart + ipsize
     payload = data[ipstart:ipend]
+    # make ipstart relative before returning
+    ipstart = ipstart - page_offset
 
     # determine size of the cell structure thus far
     cellsize = payloadsize_width + rowid_width + ipsize
@@ -520,7 +519,8 @@ def _tableleaf_cell(data, page_offset, cell_offset, usablepagesize):
         fop = _unpack_from('>I', data, offset + cellsize)[0]
         cellsize += 4
 
-    return _table_leaf_cell(payloadsize, rowid, fop, payload, ipsize, ipstart-page_offset, cell_offset, cellsize)
+    return _table_leaf_cell(payloadsize, rowid, fop, cell_offset, ipstart,
+                            cellsize, payload)
 
 
 # Table B-Tree Interior Cell fields:
@@ -557,15 +557,14 @@ def _tableinterior_cell(data, page_offset, cell_offset):
 # Index B-Tree Leaf Cell fields:
 # - payloadsize: total payload size, including overflow (if any)
 # - first_overflow_page: page number of first overflow page
-# - inline_payload: the data stored as inline payload
-# - inline_payload_size: size of the inline payload
-# - inline_payload_offset: relative offset of the inline payload within the page
 # - cell_offset: relative offset of the cell within the page
+# - inline_payload_offset: relative offset of the inline payload within the page
 # - cell_size: total size of the cell (payload_size + headersize)
+# - inline_payload: the data stored as inline payload
 _index_leaf_cell = _nt('index_leaf_cell',
-                       'payloadsize first_overflow_page inline_payload '
-                       'inline_payload_size inline_payload_offset '
-                       'cell_offset cell_size')
+                       'payloadsize first_overflow_page '
+                       'cell_offset inline_payload_offset cell_size '
+                       'inline_payload')
 
 
 def _indexleaf_cell(data, page_offset, cell_offset, usablepagesize):
@@ -594,6 +593,8 @@ def _indexleaf_cell(data, page_offset, cell_offset, usablepagesize):
     ipstart = payloadstart + offset
     ipend = ipstart + ipsize
     payload = data[ipstart:ipend]
+    # make ipstart relative before returning
+    ipstart = ipstart - page_offset
 
     # determine size of the cell structure so far
     cellsize = payloadsize_width + ipsize
@@ -605,23 +606,23 @@ def _indexleaf_cell(data, page_offset, cell_offset, usablepagesize):
         fop = _unpack_from('>I', data, offset + cellsize)[0]
         cellsize += 4
 
-    return _index_leaf_cell(payloadsize, fop, payload, ipsize, ipstart-page_offset, cell_offset, cellsize)
+    return _index_leaf_cell(payloadsize, fop, cell_offset, ipstart,
+                            cellsize, payload)
 
 
 # Index B-Tree Interior Cell fields:
 # - left_child_pointer: left child pointer (pagenumber)
 # - payloadsize: total payload size, including overflow (if any)
 # - first_overflow_page: page number of first overflow page
-# - inline_payload: the data stored as inline payload
-# - inline_payload_size: size of the inline payload
-# - inline_payload_offset: relative offset of the inline payload within the page
 # - cell_offset: relative offset of the cell within the page
+# - inline_payload_offset: relative offset of the inline payload within the page
 # - cell_size: total size of the cell (payload_size + headersize)
+# - inline_payload: the data stored as inline payload
 _index_interior_cell = _nt('index_interior_cell',
                            'left_child_pointer payloadsize '
-                           'first_overflow_page inline_payload '
-                           'inline_payload_size inline_payload_offset '
-                           'cell_offset cell_size')
+                           'first_overflow_page cell_offset '
+                           'inline_payload_offset cell_size '
+                           'inline_payload')
 
 
 def _indexinterior_cell(data, page_offset, cell_offset, usablepagesize):
@@ -653,6 +654,8 @@ def _indexinterior_cell(data, page_offset, cell_offset, usablepagesize):
     ipstart = payloadstart + offset
     ipend = ipstart + ipsize
     payload = data[ipstart:ipend]
+    # make ipstart relative before returning
+    ipstart = ipstart - page_offset
 
     # determine size of the cell thus far
     cellsize = payloadsize_width + ipsize + 4
@@ -664,7 +667,8 @@ def _indexinterior_cell(data, page_offset, cell_offset, usablepagesize):
         fop = _unpack_from('>I', data, offset + cellsize)[0]
         cellsize += 4
 
-    return _index_interior_cell(lcp, payloadsize, fop, payload, ipsize, ipstart-page_offset, cell_offset, cellsize)
+    return _index_interior_cell(lcp, payloadsize, fop, cell_offset, ipstart,
+                                cellsize, payload)
 
 
 ##########
@@ -943,7 +947,7 @@ def recordbody(data, offset, recheader):
     - recheader : the parsed recordheader with parser instructions
 
     Returns:
-    - body: Llist of storage class objects for the various objects. 
+    - body: list of storage class objects for the various objects. 
 
     Note: Some serial types are not stored in the body, but are determined by the 
     header. These have size 0. The following serial types are defined:
@@ -1003,8 +1007,9 @@ def recordbody(data, offset, recheader):
 # - next_freeblock : relative offset of next freeblock within page
 # - offset         : relative offset of this freeblock within page
 # - size           : size of the current freeblock
+# - data_offset    : offset of data in page freeblock (offset+4)
 # - data           : bytes stored in the freeblock (excluding header)
-_freeblock = _nt('freeblock', 'next_freeblock offset size block')
+_freeblock = _nt('freeblock', 'offset next_freeblock size data_offset data')
 
 
 def freeblock(data, page_offset, freeblock_offset):
@@ -1025,7 +1030,7 @@ def freeblock(data, page_offset, freeblock_offset):
     start = freeblock_offset+page_offset+4
     end = start+size-4
     fbdata = data[start:end]
-    return _freeblock(next_fb, freeblock_offset, size, fbdata)
+    return _freeblock(freeblock_offset, next_fb, size, freeblock_offset+4, fbdata)
 
 
 ################
@@ -1036,14 +1041,14 @@ def freeblock(data, page_offset, freeblock_offset):
 # overflow page fields:
 # - pagetype: 'overflow'
 # - next_overflow_page: pagenumber of next overflowpage or 0 (eoc)
-# - payload: bytes with the payload
-# - payload_size: size of the payload (usablePageSize-4)
+# - payload_offset: relative offset of the payload in the page (4)
 # - reserved_offset: relative offset of the reserved area (usablepagesize)
 # - reserved: the data stored in the reserved area for this page or None
 # - size: the page size (passed in as variable)
-_overflowpage = _nt('overflowpage', 'pagetype next_overflow_page payload '
-                                    'payload_size reserved_offset '
-                                    'reserved size')
+# - payload: bytes with the payload
+_overflowpage = _nt('overflowpage', 'pagetype next_overflow_page '
+                                    'payload_offset reserved_offset size '
+                                    'payload reserved')
 
 
 def overflowpage(data, offset, pagesize, usablepagesize):
@@ -1091,7 +1096,8 @@ def overflowpage(data, offset, pagesize, usablepagesize):
         # make the offsets relative to page offset before returning
         res_offset = res_offset - offset
 
-    return _overflowpage('overflow', next_overflow_page, payload, psize, res_offset, res, pagesize)
+    return _overflowpage('overflow', next_overflow_page, 4, res_offset, 
+                         pagesize, payload, res)
 
 
 #######################

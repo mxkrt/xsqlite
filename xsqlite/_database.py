@@ -665,10 +665,10 @@ class Payload():
             # we need the raw cell for this function
             cell = cell.parsed_cell
 
-        if cell.payloadsize > cell.inline_payload_size:
+        if cell.payloadsize > len(cell.inline_payload):
             if cell.first_overflow_page is None:
                 raise ValueError('cell has overflow, but no first_overflow_page')
-            toread = cell.payloadsize - cell.inline_payload_size
+            toread = cell.payloadsize - len(cell.inline_payload)
             return s._collect_overflow(db, toread, cell.first_overflow_page)
         return None
 
@@ -702,9 +702,9 @@ class Payload():
             # start at offset 0, since we have created a sub bitstream
             opage = _structures.overflowpage(next_pg_data, 0, db.header.pagesize, db.header.usablepagesize)
             nextpage = opage.next_overflow_page
-            if toread >= opage.payload_size:
+            if toread >= len(opage.payload):
                 pload.append(opage.payload)
-                toread -= opage.payload_size
+                toread -= len(opage.payload)
             else:
                 remainder = opage.payload[0:toread]
                 slack = opage.payload[toread:]
@@ -799,7 +799,7 @@ class RowidRecord():
             s.pagesource = cell.pagesource
             s.cellnumber = cell.cellnumber
             s.rowid = cell.parsed_cell.rowid
-            s.inlinesize = cell.parsed_cell.inline_payload_size
+            s.inlinesize = len(cell.parsed_cell.inline_payload)
             s.payloadsize = cell.parsed_cell.payloadsize
             s.payloadoffset = cell.parsed_cell.inline_payload_offset
             pload = cell.payload
@@ -809,7 +809,7 @@ class RowidRecord():
             s.pagesource = None
             s.cellnumber = None
             s.rowid = cell.rowid
-            s.inlinesize = cell.inline_payload_size
+            s.inlinesize = len(cell.inline_payload)
             s.payloadsize = cell.payloadsize
             s.payloadoffset = cell.inline_payload_offset
             pload = Payload(s, cell)
