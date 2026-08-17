@@ -11,14 +11,14 @@ also not implemented. WAL support is implemented, but JOURNAL support is not. ''
 from collections import namedtuple as _nt
 from collections import OrderedDict as _OD
 from functools import partial as _partial
-from bitstring import ConstBitStream as _CB
 import os.path as _path
 from os import stat as _stat
 from enum import Enum as _Enum
+from struct import unpack as _unpack
+import mmap as _mmap
 
 from . import _exceptions
 from . import _structures
-from . import _block
 from . import _sql
 from . import _decode
 
@@ -42,24 +42,36 @@ class Database():
         if isinstance(infile, str):
             # parse the file as constant bitstream
             s.filename = _path.abspath(_path.expanduser(infile))
-            s.bitstream = _CB(filename=s.filename)
-        else:
+            dbfile = open(s.filename, 'rb')
+            s.data = _mmap.mmap(dbfile.fileno(), 0, access=_mmap.ACCESS_READ)
+        elif isinstance(infile, _mmap.mmap):
+            # we already have an mmapped file
+            s.filename = None
+            s.data = infile
+        elif hasattr(infile, 'read') and hasattr(infile, 'seek'):
             # read the bytes from the file as constant bitstream
             s.filename = None
-            s.bitstream = _CB(bytes=infile.read())
+            s.data = _mmap.mmap(infile.fileno(), 0, access=_mmap.ACCESS_READ)
+        else:
+            raise ValueError("expected filename, mmapped file or file-like object")
 
         if wal is not None:
             if isinstance(wal, str):
-                # parse the file as constant bitstream
+                # open and mmap the file and parse as WalFile
                 walfilename = _path.abspath(_path.expanduser(wal))
                 if _stat(walfilename).st_size != 0:
-                    walbitstream = _CB(filename=walfilename)
-                    s.walfile = WalFile(walfilename, walbitstream)
+                    wfile = open(walfilename, 'rb')
+                    wfile_mmap = _mmap.mmap(wfile.fileno(), 0, access=_mmap.ACCESS_READ)
+                    s.walfile = WalFile(walfilename, wfile_mmap)
+            elif isinstance(wal, _mmap.mmap):
+                # we already have an mmapped file, parse as WalFile
+                s.walfile = WalFile(None, wal)
+            elif hasattr(wal, 'read') and hasattr(wal, 'seek'):
+                # a file-like-object, mmap and parse as WalFile
+                wfile_mmap = _mmap.mmap(wal.fileno(), 0, access=_mmap.ACCESS_READ)
+                s.walfile = WalFile(None, wfile_mmap)
             else:
-                # read the bytes from the file as constant bitstream
-                walfilename = None
-                walbitstream = _CB(bytes=wal.read())
-                s.walfile = WalFile(walfilename, walbitstream)
+                raise ValueError("expected filename, mmapped file or file-like object")
         else:
             # check if a WAL file exists in the same directory as the main db file
             if s.filename is not None:
@@ -69,18 +81,25 @@ class Database():
                 if _path.exists(walpath):
                     walfilename = walpath
                     if _stat(walfilename).st_size != 0:
-                        walbitstream = _CB(filename=walfilename)
-                        s.walfile = WalFile(walfilename, walbitstream)
+                        wfile = open(walfilename, 'rb')
+                        wfile_mmap = _mmap.mmap(wfile.fileno(), 0, access=_mmap.ACCESS_READ)
+                        s.walfile = WalFile(walfilename, wfile_mmap)
 
         if journal is not None:
             if isinstance(journal, str):
-                # parse the file as constant bitstream
+                # open and mmap the file (parsing not yet supported)
                 s.journalfilename = _path.abspath(_path.expanduser(journal))
-                s.journalbitstream = _CB(filename=s.journalfilename)
+                if _stat(s.journalfilename).st_size != 0:
+                    jfile = open(s.journalfilename, 'rb')
+                    s.journaldata = _mmap.mmap(jfile.fileno(), 0, access=_mmap.ACCESS_READ)
+            elif isinstance(journal, _mmap.mmap):
+                # we already have an mmapped file
+                s.journaldata = journal
+            elif hasattr(journal, 'read') and hasattr(journal, 'seek'):
+                s.journaldata = _mmap.mmap(jfile.fileno(), 0, access=_mmap.ACCESS_READ)
             else:
-                # read the bytes from the file as constant bitstream
-                s.journalfilename = None
-                s.journalbitstream = _CB(bytes=journal.read())
+                raise ValueError("expected filename, mmapped file or file-like object")
+
         else:
             # check if a journal file exists in the same directory as the main db file
             if s.filename is not None:
@@ -89,17 +108,18 @@ class Database():
                 journalpath = _path.join(dirname, basename+'-journal')
                 if _path.exists(journalpath):
                     s.journalfilename = journalpath
-                    s.journalbitstream = _CB(filename=s.journalfilename)
+                    if _stat(s.journalfilename).st_size != 0:
+                        jfile = open(s.journalfilename, 'rb')
+                        s.journaldata = _mmap.mmap(jfile.fileno(), 0, access=_mmap.ACCESS_READ)
 
-
-        if hasattr(s, 'walfile') and hasattr(s, 'journalbitstream'):
+        if hasattr(s, 'walfile') and hasattr(s, 'journaldata'):
             raise ValueError('database appears to have a WAL and a journal file!')
 
         # parse the header at offset 0
-        s.header = _structures.dbheader(s.bitstream.bytes, offset=0)
+        s.header = _structures.dbheader(s.data, offset=0)
 
         if hasattr(s, 'walfile'):
-            if s.header.pagesize != s.walfile.pagesize:
+            if s.header.pagesize != s.walfile.header.pagesize:
                 raise _exceptions.AssumptionBrokenException("wal and main db disagree on pagesize")
 
         # check if the header indicates wal mode or not
@@ -147,7 +167,7 @@ class Database():
         # if the page is an active page in the WAL file, return the WAL frame contents offset
         if s.page_is_in_wal(pagenumber):
             walframe = s.walfile.get_page_frame(pagenumber)
-            return walframe.contents_block.offset
+            return walframe.contents_offset
 
         if s.header.inheadersizevalid and pagenumber > s.header.dbsize:
             raise _exceptions.InvalidArgumentException('pagenumber points beyond EOF')
@@ -165,9 +185,11 @@ class Database():
         if hasattr(s, 'walfile'):
             walframe = s.walfile.get_page_frame(pagenumber)
             if walframe is not None:
-                return walframe.contents_block
+                return walframe.contents
 
-        return _block.block(s.bitstream, s.get_pageoffset(pagenumber), s.header.pagesize)
+        start = s.get_pageoffset(pagenumber)
+        end = start + s.header.pagesize
+        return s.data[start:end]
 
 
     def page_is_in_wal(s, pagenumber):
@@ -187,20 +209,19 @@ class Database():
         parsed page. This function is a wrapper for _structures.btree_page.
         '''
 
-        pageblock = s.get_page_data(pagenumber)
-        pagesize = pageblock.size
-        btstr = pageblock.data()
-        pageoffset = s.get_pageoffset(pagenumber)
-
+        pg_offset = s.get_pageoffset(pagenumber)
+        # TODO: instead of slicing, pass the correct mmapped data (main or wal)
+        # and the pg_offset into _structures.btree_page?
+        pg_data = s.get_page_data(pagenumber)
         # start with the page with the given pagenumber
         isheaderpage = False
         if pagenumber == 1:
             isheaderpage = True
 
-        # use offset 0 here, since btstr contains only the single page to be parsed
-        page = _structures.btree_page(btstr, 0, s.header.pagesize, s.header.usablepagesize, isheaderpage)
+        # use offset 0 here, since data contains only the single page to be parsed
+        page = _structures.btree_page(pg_data, 0, s.header.pagesize, s.header.usablepagesize, isheaderpage)
         from_wal = s.page_is_in_wal(pagenumber)
-        return Page(btstr, page, pagenumber, pageoffset, from_wal)
+        return Page(pg_data, page, pagenumber, pg_offset, from_wal)
 
 
     def get_page_by_rowid(s, rootpagenumber, rowid):
@@ -324,22 +345,19 @@ class Database():
             return
 
         # parse and yield the freelist trunkpage
-        rootpg = s.get_page_data(freelist_trunkpage_number)
+        pg_data = s.get_page_data(freelist_trunkpage_number)
         pageoffset = s.get_pageoffset(freelist_trunkpage_number)
-        pagesize = rootpg.size
-        btstr = rootpg.data()
-        rootfltpage = _structures.freelisttrunkpage(btstr, 0, pagesize, s.header.usablepagesize)
+        rootfltpage = _structures.freelisttrunkpage(pg_data, 0, s.header.pagesize, s.header.usablepagesize)
         from_wal = s.page_is_in_wal(freelist_trunkpage_number)
-        yield Page(btstr, rootfltpage, freelist_trunkpage_number, pageoffset, from_wal)
+        yield Page(pg_data, rootfltpage, freelist_trunkpage_number, pageoffset, from_wal)
 
         # yield all pages pointed to by the leaf pointers in the trunkpage
         for pgnum in rootfltpage.freelistleafpointers:
-            pg = s.get_page_data(pgnum)
+            pg_data = s.get_page_data(pgnum)
             pg_offset = s.get_pageoffset(pgnum)
-            btstr = pg.data()
-            leafpage = _structures.freelistleafpage(btstr, 0, pagesize, s.header.usablepagesize)
+            leafpage = _structures.freelistleafpage(pg_data, 0, s.header.pagesize, s.header.usablepagesize)
             from_wal = s.page_is_in_wal(pgnum)
-            yield Page(btstr, leafpage, pgnum, pg_offset, from_wal)
+            yield Page(pg_data, leafpage, pgnum, pg_offset, from_wal)
 
         # continue with the next freelist trunk page
         for pg in s._freelist_pages(rootfltpage.nextfreelisttrunkpage):
@@ -379,11 +397,11 @@ class Database():
             pageoffset = (pagenumber - 1) * s.header.pagesize
 
             # get the page_data from the main database file, not via get_page_data API
-            btstr = _block.block(s.bitstream, pageoffset, s.header.pagesize).data()
+            data = s.data[pageoffset:pageoffset+s.header.pagesize]
             # unpack as a generic page
-            page = _structures.genericpage(btstr, 0, s.header.pagesize)
+            page = _structures.genericpage(data, 0, s.header.pagesize)
             from_wal = False
-            yield Page(btstr, page, pagenumber, pageoffset, from_wal)
+            yield Page(data, page, pagenumber, pageoffset, from_wal)
 
 
     def rowidrecords(s, rootpagenumber):
@@ -457,9 +475,8 @@ class Database():
         '''
 
         for c in cls:
-            data = _block.allblocklistdata(c.payload.blocklist)
-            bytes_ = data.bytes
-            yield RecordHeader(_structures.recordheader(bytes_, 0), c.cellnumber, c.pagenumber)
+            data = b''.join(c.payload.blocklist)
+            yield RecordHeader(_structures.recordheader(data, 0), c.cellnumber, c.pagenumber)
 
 
 class SQLiteMaster():
@@ -648,10 +665,10 @@ class Payload():
             # we need the raw cell for this function
             cell = cell.parsed_cell
 
-        if cell.payloadsize > cell.inline_payload.size:
+        if cell.payloadsize > cell.inline_payload_size:
             if cell.first_overflow_page is None:
                 raise ValueError('cell has overflow, but no first_overflow_page')
-            toread = cell.payloadsize - cell.inline_payload.size
+            toread = cell.payloadsize - cell.inline_payload_size
             return s._collect_overflow(db, toread, cell.first_overflow_page)
         return None
 
@@ -680,18 +697,17 @@ class Payload():
                 raise ValueError('nextpage available but no more bytes to read')
 
             # get the next overflowpage
-            next_pg = db.get_page_data(nextpage)
-            pagesize = next_pg.size
-            btstr = next_pg.data()
+            next_pg_data = db.get_page_data(nextpage)
 
             # start at offset 0, since we have created a sub bitstream
-            opage = _structures.overflowpage(btstr, 0, pagesize, db.header.usablepagesize)
+            opage = _structures.overflowpage(next_pg_data, 0, db.header.pagesize, db.header.usablepagesize)
             nextpage = opage.next_overflow_page
-            if toread >= opage.payload.size:
+            if toread >= opage.payload_size:
                 pload.append(opage.payload)
-                toread -= opage.payload.size
+                toread -= opage.payload_size
             else:
-                remainder, slack = _block.splitblock(opage.payload, toread)
+                remainder = opage.payload[0:toread]
+                slack = opage.payload[toread:]
                 pload.append(remainder)
                 toread = 0
 
@@ -709,12 +725,12 @@ class Page():
     ''' wrapper for parsed pages with some extra meta-data '''
 
 
-    def __init__(s, bitstream, parsed_page, pagenum=None, offset=None, from_wal=False):
+    def __init__(s, data, parsed_page, pagenum=None, offset=None, from_wal=False):
         ''' initialize Page object, optionally setting pagenumber and offset to given values '''
 
         s.pagenumber = pagenum
         s.pageoffset = offset
-        s.bitstream = bitstream
+        s.data = data
         s.page = parsed_page
         if from_wal is True:
             s.pagesource = PageSource.WALFile
@@ -783,9 +799,9 @@ class RowidRecord():
             s.pagesource = cell.pagesource
             s.cellnumber = cell.cellnumber
             s.rowid = cell.parsed_cell.rowid
-            s.inlinesize = cell.parsed_cell.inline_payload.size
+            s.inlinesize = cell.parsed_cell.inline_payload_size
             s.payloadsize = cell.parsed_cell.payloadsize
-            s.payloadoffset = cell.parsed_cell.inline_payload.offset
+            s.payloadoffset = cell.parsed_cell.inline_payload_offset
             pload = cell.payload
         else:
             s.pagenumber = None
@@ -793,9 +809,9 @@ class RowidRecord():
             s.pagesource = None
             s.cellnumber = None
             s.rowid = cell.rowid
-            s.inlinesize = cell.inline_payload.size
+            s.inlinesize = cell.inline_payload_size
             s.payloadsize = cell.payloadsize
-            s.payloadoffset = cell.payload.offset
+            s.payloadoffset = cell.inline_payload_offset
             pload = Payload(s, cell)
 
         if len(pload.overflowpages) == 0:
@@ -803,21 +819,20 @@ class RowidRecord():
         else:
             s.has_overflow = True
 
-        # construct a new bitstring for the payload
-        btstr = _block.allblocklistdata(pload.blocklist)
+        # combine the individual blocks into a combined blocklist
+        payload_data = b''.join(pload.blocklist)
         # check if length matches defined payloadsize (btstr is in bits)
-        if int(len(btstr)/8) != s.payloadsize:
-            raise RuntimeError('created payload bitstring not correct size')
+        if len(payload_data) != s.payloadsize:
+            raise RuntimeError('combined payload is not the correct size')
 
         # parse as recordformat struct
-        recdata = _structures.recordformat(btstr, 0)
+        recdata = _structures.recordformat(payload_data, 0)
         s.header = recdata.header
         s.body = recdata.body
 
         # sanity check on payload size and total size of header + body
         sizes = [_structures.serialtype(t).size for t in recdata.header.serialtypes]
         definedsize = sum(sizes) + recdata.header.headersize
-        availablesize = len(btstr)
         if definedsize != s.payloadsize:
             raise RuntimeError('mismatch between size in recordheader and payloadsize.')
 
@@ -842,25 +857,27 @@ class WalFile():
     frames within the WAL are valid and which are leftovers from prior
     checkpoints.  '''
 
-    def __init__(s, filename, bitstream):
-        ''' initialize a WAL file object from the given bitstream '''
+    def __init__(s, filename, mmapped_file):
+        ''' initialize a WAL file object from the given mmapped file '''
 
         s.filename = filename
-        s.bitstream = bitstream
+        s.data = mmapped_file
 
         # wal file size
-        s.filesize = s.bitstream.length // 8
+        s.filesize = s.data.size()
 
         # parse the walheader
-        walheader = _structures.walheader(s.bitstream, 0)
+        s.header = _structures.walheader(s.data[0:32], 0)
+
         # and extract the properties to WalFile properties
-        s.pagesize = walheader.pagesize
-        s.checkpoint_sequence_number = walheader.checkpoint_sequence_number
-        s.salt1 = walheader.salt1
-        s.salt2 = walheader.salt2
-        s.checksum1 = walheader.checksum1
-        s.checksum2 = walheader.checksum2
-        s.checksum_endianness = walheader.checksum_endianness
+        # TODO: remove these and update references accordingly
+        s.pagesize = s.header.pagesize
+        s.checkpoint_sequence_number = s.header.checkpoint_sequence_number
+        s.salt1 = s.header.salt1
+        s.salt2 = s.header.salt2
+        s.checksum1 = s.header.checksum1
+        s.checksum2 = s.header.checksum2
+        s.checksum_endianness = s.header.checksum_endianness
 
         # amount of bytes available for frames is filesize minus header
         frame_bytecount = s.filesize - 32
@@ -882,12 +899,12 @@ class WalFile():
             # of the WAL file, thus instead of failing here, we include this
             # remaining data as slack.
 
-            slacksize = s.filesize - 32 - (s.frame_count * s.frame_size)
-            if slacksize > s.frame_size:
+            s.slack_size = s.filesize - 32 - (s.frame_count * s.frame_size)
+            if s.slack_size > s.frame_size:
                 raise ValueError("a mistake was made in slack calculation")
 
-            slackoffset = 32 + (s.frame_count * s.frame_size)
-            s.slack = _block.block(bitstream, slackoffset, slacksize)
+            s.slack_offset = 32 + (s.frame_count * s.frame_size)
+            s.slack = s.data[s.slack_offset:s.slack_offset+s.slack_size]
 
         # from the sqlite amalgamation source file we learn (line numbers added):
 
@@ -1007,9 +1024,9 @@ class WalFile():
         current_frames = []
         outdated_frames = []
         for frame in s.allframes():
-            if frame.salt1 == s.salt1 and frame.salt2 == s.salt2:
+            if frame.header.salt1 == s.header.salt1 and frame.header.salt2 == s.header.salt2:
                 current_frames.append(frame.framenumber)
-            elif frame.salt1 != s.salt1 and frame.salt2 != s.salt2:
+            elif frame.header.salt1 != s.header.salt1 and frame.header.salt2 != s.header.salt2:
                 outdated_frames.append(frame.framenumber)
             else:
                 raise ValueError("one of the two salt values matches, the other does not!")
@@ -1081,7 +1098,7 @@ class WalFile():
         for fnum in range(1, last_valid_frame + 1):
             frame = s.get_frame(fnum)
             # check if this is also a commit frame
-            if frame.commit_page_count != 0:
+            if frame.header.commit_page_count != 0:
                 # this is a commit frame, update mxFrame value
                 s.mxFrame = fnum
 
@@ -1146,7 +1163,7 @@ class WalFile():
 
         for i in range(1, s.mxFrame + 1):
             frame = s.get_frame(i)
-            pgnum = frame.pagenumber
+            pgnum = frame.header.pagenumber
             if pgnum in s._checkpoint_frames:
                 # the old version is superseded
                 old_framenumber = s._checkpoint_frames[pgnum]
@@ -1175,7 +1192,7 @@ class WalFile():
 
         offset = s._frame_offset(framenumber)
 
-        return WalFrame(s.bitstream, framenumber, offset, s.pagesize)
+        return WalFrame(s.data, framenumber, offset, s.pagesize)
 
 
     def allframes(s, only_valid=False):
@@ -1231,13 +1248,11 @@ class WalFile():
         # pages from the WAL file that have been superseded by a page from a later WAL frame
         for frame in s.superseded_frames():
             # determine the offset of the page in the WAL file
-            pageoffset = frame.contents_block.offset
-            # get the page data from the wal frame
-            btstr = frame.contents_block.data()
+            pageoffset = frame.contents_offset
             # unpack as a generic page
-            page = _structures.genericpage(btstr, 0, s.pagesize)
+            page = _structures.genericpage(frame.contents, 0, s.pagesize)
             from_wal = True
-            yield Page(btstr, page, frame.pagenumber, pageoffset, from_wal)
+            yield Page(frame.contents, page, frame.pagenumber, pageoffset, from_wal)
 
 
     def outdated_pages(s):
@@ -1249,36 +1264,39 @@ class WalFile():
         # pages from the WAL file that have been superseded by a page from a later WAL frame
         for frame in s.outdated_frames():
             # determine the offset of the page in the WAL file
-            pageoffset = frame.contents_block.offset
-            # get the page data from the wal frame
-            btstr = frame.contents_block.data()
+            pageoffset = frame.contents_offset
             # unpack as a generic page
-            page = _structures.genericpage(btstr, 0, s.pagesize)
+            page = _structures.genericpage(frame.contents, 0, s.pagesize)
             from_wal = True
-            yield Page(btstr, page, frame.pagenumber, pageoffset, from_wal)
+            yield Page(frame.contents, page, frame.pagenumber, pageoffset, from_wal)
 
 
 class WalFrame():
     ''' class representing a single frame in a WAL file '''
 
-    def __init__(s, bitstream, framenumber, offset, pagesize):
+    def __init__(s, mmapped_walfile, framenumber, offset, pagesize):
         ''' initialize a frame from given offset in bitstream using given pagesize '''
 
         s.framenumber = framenumber
-        # store the header and contents as block object so we can feed these
-        # to various parsers
-        s.header_block = _block.block(bitstream, offset, 24)
-        s.contents_block = _block.block(bitstream, offset+24, pagesize)
+        # the offset of the frame within the WAL
+        s.offset = offset
+        # the offset of the contents (i.e. the page data) within the WAL
+        s.contents_offset = offset+24
+        # separate the header and contents as so we can parse them individually
+        s.header_data = mmapped_walfile[offset:s.contents_offset]
+        # store the contents as bytes array
+        s.contents = mmapped_walfile[s.contents_offset:s.contents_offset+pagesize]
 
         # parse the frame header
-        frame_header = _structures.walframeheader(s.header_block.data(), 0)
+        s.header = _structures.walframeheader(s.header_data, 0)
         # and promote properties to be walframe properties
-        s.pagenumber = frame_header.pagenumber
-        s.commit_page_count = frame_header.commit_page_count
-        s.salt1 = frame_header.salt1
-        s.salt2 = frame_header.salt2
-        s.checksum1 = frame_header.checksum1
-        s.checksum2 = frame_header.checksum2
+        # TODO: remove these, instead use reference to walframe header everywhere
+        s.pagenumber = s.header.pagenumber
+        s.commit_page_count = s.header.commit_page_count
+        s.salt1 = s.header.salt1
+        s.salt2 = s.header.salt2
+        s.checksum1 = s.header.checksum1
+        s.checksum2 = s.header.checksum2
 
 
     def compute_checksum(s, endianness, init_checksum1=0, init_checksum2=0):
@@ -1293,18 +1311,18 @@ class WalFrame():
 
         # so first, combine the data from the first 8 bytes of the header
         # and the full contents
-        header_data = s.header_block.data()[0:64]
-        contents_data = s.contents_block.data()
-        all_data = header_data + contents_data
+        crc_data = s.header_data[0:8] + s.contents
 
         # total number of DWORDs to read
-        dword_count = all_data.length // 8 // 4
+        dword_count = len(crc_data) // 4
 
         # read frame contents according to checksum endianess
         if endianness == 'little':
-            integers = all_data.readlist(['uintle:32']*dword_count)
+            fmt = '<' + 'I' * dword_count
+            integers = _unpack(fmt, crc_data)
         elif endianness == 'big':
-            integers = all_data.readlist(['uintbe:32']*dword_count)
+            fmt = '>' + 'I' * dword_count
+            integers = _unpack(fmt, crc_data)
 
         c1,c2 = _structures._walchecksum(integers, init_checksum1, init_checksum2)
         return (c1, c2)
