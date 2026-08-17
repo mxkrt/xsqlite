@@ -5,8 +5,6 @@ Copyright (c) 2014-2026 Netherlands Forensic Institute - MIT License
 
 from binascii import hexlify as _hexlify
 from collections import namedtuple as _nt
-from bitstring import BitStream as _BS
-from bitstring import ConstBitStream as _CB
 from os.path import abspath as _abspath
 from os.path import expanduser as _expanduser
 from os.path import exists as _exists
