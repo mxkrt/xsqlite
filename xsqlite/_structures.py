@@ -1,23 +1,56 @@
 ''' _structures - basic structures in the SQLite3 file format
 
-Copyright (c) 2022 Netherlands Forensic Institute - MIT License
+Copyright (c) 2014-2026 Netherlands Forensic Institute - MIT License
+Copyright (c) 2025-2026 mxkrt@lsjam.nl - MIT License
 
 The implementation of the structures and the logic is based on the description
 of the database format as given on: https://www.sqlite.org/fileformat.html
 '''
 
 from struct import unpack_from as _unpack_from
-
 from collections import namedtuple as _nt
-from bitstring import BitStream as _BS
-
-from ._block import block as _block
 
 
 ###################
 # database header #
 ###################
 
+# dbheader fields:
+# - headerstring: The header string 'SQLite format 3[0x00]'
+# - pagesize: The database page size in bytes. Size 1 means 65536
+# - writeversion: file format write version. 1 for legacy; 2 for WAL.
+# - readversion: file format read version. 1 for legacy; 2 for WAL.
+# - reservedspace: Bytes of unused "reserved" space at the end of
+#   each page. Usually 0.
+# - maxpayloadfraction: maximum embedded payload fraction.
+# - minpayloadfraction: minimum embedded payload fraction.
+# - leafpayloadfraction: Leaf payload fraction.
+# - filechangecounter: File change counter. Note: the change counter
+#   might not be incremented on each transaction in WAL mode.
+# - dbsize: Size of the database file in pages, a.k.a. the "in-header
+#   database size".
+# - firstfreelisttrunkpage: Page number of the first freelist trunk page.
+# - totalfreelistpages: Total number of freelist pages.
+# - schemacookie: The schema cookie.
+# - schemaformat: The schema format number.
+# - defaultpagecachesize: Default page cache size.
+# - largestrootbtreepage: The page number of the largest root b-tree page
+#   when in auto- or incremental vacuum mode, zero otherwise.
+# - textencoding: The database text encoding.
+# - userversion: The "user version" as read and set by the user_version
+#   pragma. Not used by SQLite internally.
+# - vacuummode: True (non-zero) for incremental-vacuum mode.  False
+#   (zero) otherwise.
+# - "Application ID" set by PRAGMA application_id.
+# - reserved: 20 bytes reserved for expansion. Must be zero.
+# - validfor: The version-valid-for number
+# - version: SQLITE_VERSION_NUMBER field
+# - usablepagesize: calculated usable page size
+# - externalsize: calculated size of database in pages based on available data
+#   (may be wrong if only part of th data was passed into function).
+# - inheadersizevalid: indicates if in-header database size is valid
+#   The 'in header database size' is only valid if it is nonzero
+#   and if the filechange counter matches the validfor number.
 _dbheader = _nt('database_header', 'headerstring pagesize writeversion '
                 'readversion reservedspace maxpayloadfraction '
                 'minpayloadfraction leafpayloadfraction filechangecounter '
@@ -28,104 +61,64 @@ _dbheader = _nt('database_header', 'headerstring pagesize writeversion '
                 'usablepagesize externalsize inheadersizevalid')
 
 
+# map encoding numbers to human-readable encoding string
+# Note: while only the encodings 1 through 3 are allowed per the
+# documentation on the sqlite3 website. We have found several
+# databases with encoding 0. After some searching through the
+# sqlite3 amalgamation source we found the following:
+#
+# 109621       if( encoding==0 ) encoding = SQLITE_UTF8;
+#
+# Thus, an encoding of 0 is also allowed and indicates UTF8
+_encoding = {0: 'utf-8',
+             1: 'utf-8',
+             2: 'utf-16le',
+             3: 'utf-16be'}
+
+
 def dbheader(data, offset=0):
     ''' Parse given bytes as database header
 
     Arguments:
-
     - data     : bytes containing the database header
     - offset   : offset of the dbheader structure
 
     Returns:
-
-    - dbheader : named tuple with the parsed database header
+    - dbheader : namedtuple with the parsed database header
     '''
 
-    # map encoding numbers to human-readable encoding string
-    # Note: while only the encodings 1 through 3 are allowed per the
-    # documentation on the sqlite3 website. We have found several
-    # databases with encoding 0. After some searching through the
-    # sqlite3 amalgamation source we found the following:
-    #
-    # 109621       if( encoding==0 ) encoding = SQLITE_UTF8;
-    #
-    # Thus, an encoding of 0 is also allowed and indicates UTF8
-    _encoding = {0: 'utf-8',
-                 1: 'utf-8',
-                 2: 'utf-16le',
-                 3: 'utf-16be'}
-
-    # headerstring: The header string 'SQLite format 3[0x00]'
-    headerstring = data[offset:offset+16].decode('utf-8')
-
-    # parse the fields between header string and reserved area
-    fmt = '>H' + 'B'*6 + 'I'*12
-    parsed = _unpack_from(fmt, data, 16)
-    # pagesize: The database page size in bytes. Size 1 means 65536
-    pagesize = parsed[0]
+    # parse bytes according to Database Header Format
+    fmt = '>16sH' + 'B'*6 + 'I'*12 + '20sII'
+    parsed = _unpack_from(fmt, data, offset)
+    headerstring = parsed[0].decode('utf-8')
+    pagesize = parsed[1]
     if pagesize == 1:
         pagesize = 65536
-    # writeversion: file format write version. 1 for legacy; 2 for WAL.
-    writeversion = parsed[1]
-    # readversion: file format read version. 1 for legacy; 2 for WAL.
-    readversion = parsed[2]
-    # reservedspace: Bytes of unused "reserved" space at the end of
-    # each page. Usually 0.
-    reservedspace = parsed[3]
-    # maxpayloadfraction: maximum embedded payload fraction.
-    maxpayloadfraction = parsed[4]
-    # minpayloadfraction: minimum embedded payload fraction.
-    minpayloadfraction = parsed[5]
-    # leafpayloadfraction: Leaf payload fraction.
-    leafpayloadfraction = parsed[6]
-    # filechangecounter: File change counter. Note: the change counter
-    # might not be incremented on each transaction in WAL mode.
-    filechangecounter = parsed[7]
-    # dbsize: Size of the database file in pages, a.k.a. the "in-header
-    # database size".
-    dbsize = parsed[8]
-    # firstfreelisttrunkpage: Page number of the first freelist trunk page.
-    firstfreelisttrunkpage = parsed[9]
-    # totalfreelistpages: Total number of freelist pages.
-    totalfreelistpages = parsed[10]
-    # schemacookie: The schema cookie.
-    schemacookie = parsed[11]
-    # schemaformat: The schema format number.
-    schemaformat = parsed[12]
-    # defaultpagecachesize: Default page cache size.
-    defaultpagecachesize = parsed[13]
-    # largestrootbtreepage: The page number of the largest root b-tree page
-    # when in auto- or incremental vacuum mode, zero otherwise.
-    largestrootbtreepage = parsed[14]
-    # textencoding: The database text encoding.
-    textencoding = _encoding[parsed[15]]
-    # userversion: The "user version" as read and set by the user_version
-    # pragma. Not used by SQLite internally.
-    userversion = parsed[16]
-    # vacuummode: True (non-zero) for incremental-vacuum mode.  False
-    # (zero) otherwise.
-    vacuummode = bool(parsed[17])
-    # "Application ID" set by PRAGMA application_id.
-    applicationID = parsed[18]
+    writeversion = parsed[2]
+    readversion = parsed[3]
+    reservedspace = parsed[4]
+    maxpayloadfraction = parsed[5]
+    minpayloadfraction = parsed[6]
+    leafpayloadfraction = parsed[7]
+    filechangecounter = parsed[8]
+    dbsize = parsed[9]
+    firstfreelisttrunkpage = parsed[10]
+    totalfreelistpages = parsed[11]
+    schemacookie = parsed[12]
+    schemaformat = parsed[13]
+    defaultpagecachesize = parsed[14]
+    largestrootbtreepage = parsed[15]
+    textencoding = _encoding[parsed[16]]
+    userversion = parsed[17]
+    vacuummode = bool(parsed[18])
+    applicationID = parsed[19]
+    reserved = int.from_bytes(parsed[20], byteorder='big', signed=False)
+    validfor = parsed[21]
+    version = parsed[22]
 
-    # reserved: 20 bytes reserved for expansion. Must be zero.
-    reserved = int.from_bytes(data[72:92], byteorder='big', signed=False)
-
-    # parse the remaining fields
-    fmt = '>II'
-    # validfor: The version-valid-for number
-    # version: SQLITE_VERSION_NUMBER field
-    validfor, version = _unpack_from(fmt, data, 92)
-
-    # usablepagesize: calculated usable page size
+    # calculated and derived fields
     usablepagesize = pagesize - reservedspace
-    # externalsize: calculated size of database in pages based on bitstream
-    # size (may be wrong if only part of th data was passed into function).
     externalsize = int(len(data) / pagesize)
-
-    # inheadersizevalid: indicates if in-header database size is valid
-    # The 'in header database size' is only valid if it is nonzero
-    # and if the filechange counter matches the validfor number.
     inheadersizevalid = True
     if dbsize == 0 or filechangecounter != validfor:
         inheadersizevalid = False
@@ -170,9 +163,7 @@ def dbheader(data, offset=0):
     if schemaformat not in [0, 1, 2, 3, 4]:
         raise ValueError('Supported schema formats are 0,1,2,3,4')
     if reserved != 0:
-        raise ValueError('Space used for expansion should be zero.')
-    if externalsize % 1 != 0:
-        raise ValueError('db size should be multiple of page size.')
+        raise ValueError('Data in reserved area of header should be 0x00.')
 
     return _dbheader(headerstring, pagesize, writeversion,
                      readversion, reservedspace, maxpayloadfraction,
@@ -189,6 +180,14 @@ def dbheader(data, offset=0):
 # pageheader #
 ##############
 
+# pageheader fields:
+# - pagetype: the type of b-tree page
+# - first_freeblock_offset: relative offset of the first freeblock.
+# - cellcount: number of cells on this page.
+# - cell_content_offset: relative offset of cell content area.
+# - fragmented_freebyte_count: total number of fragmented free bytes.
+# - rightmost_pointer: the right-most pointer for interior pages.
+# - size: the size of the btree_pageheader
 _pageheader = _nt('btree_pageheader',
                   'pagetype first_freeblock_offset cellcount '
                   'cell_content_offset fragmented_freebyte_count '
@@ -223,21 +222,12 @@ def pageheader(data, offset, usablepagesize):
     ''' Parse given bytes as btree pageheader
 
     Arguments:
-
     - data           : bytes containing the btree pageheader
     - offset         : offset of the btree pageheader structure
     - usablepagesize : usable page size as calculated from database header
 
     Returns:
-
-    - btree_pageheader : named tuple with the following fields:
-        - pagetype: the type of b-tree page as defined in _pagetype
-        - first_freeblock_offset: relative offset of the first freeblock.
-        - cellcount: number of cells on this page.
-        - cell_content_offset: relative offset of cell content area.
-        - fragmented_freebyte_count: total number of fragmented free bytes.
-        - rightmost_pointer: the right-most pointer for interior pages.
-        - size: the size of the btree_pageheader
+    - pageheader     : named tuple with parsed btree pageheader
     '''
 
     # parse first 8 bytes
@@ -273,41 +263,54 @@ def pageheader(data, offset, usablepagesize):
 # btree page #
 ##############
 
-_btreepage = _nt('btree_page', 'pagetype header cellpointer_area '
-                               'cells rowidmap freeblocks unallocated '
-                               'reserved size')
+# btree page fields:
+# - pagetype: one of the four pagetypes defined in pagetype function
+# - header_offset: relative offset of header (mostly 0, except for page 1)
+# - header: the btree_pageheader for the current page
+# - cellpointer_offset : relative offset of the cellpointer area within the page
+# - cellpointer_area: the parsed cellpointer_area for the current page
+# - cells: a list of parsed cells
+# - rowidmap: {rowid:cellnumber} for table_leaf pages, None otherwise
+# - freeblocks: a list of freeblocks for this page
+# - unallocated_offset: relative offset of the unallocated space
+# - unallocated: the data stored in the unallocated area for this page
+# - unallocated_size : size of the unallocated space
+# - reserved_offset: relative offset of the reserved area (usablepagesize)
+# - reserved: the data stored in the reserved area for this page or None
+# - size: the page size (passed in as variable)
+_btreepage = _nt('btree_page', 'pagetype header_offset header '
+                               'cellpointer_offset cellpointer_area '
+                               'cells rowidmap freeblocks '
+                               'unallocated_offset unallocated_data '
+                               'unallocated_size '
+                               'reserved_offset reserved_data size')
 
 
-def btree_page(btstr, offset, pagesize, usablepagesize, isheaderpage=False):
-    ''' Parses the page at the given offset as btree page.
+def btree_page(data, offset, pagesize, usablepagesize, isheaderpage=False):
+    ''' Parse given bytes as bree page
 
-    A btree_page object has the following fields:
+    Arguments:
+    - data           : bytes containing the page
+    - offset         : offset of the page structure
+    - pagesize       : pagesize as stored in database header
+    - usablepagesize : offset of the reserved area in the page
+    - isheaderpage   : if True, assume database header in first 100 bytes
 
-        - pagetype: one of the four pagetypes defined in pagetype function
-        - header: the btree_pageheader object for the current page
-        - cellpointer_area: the cellpointer_area object for the current page
-        - cells: a list of cell objects (see cell.py)
-        - rowidmap: {rowid:cellnumber} for table_leaf pages, None otherwise
-        - freeblocks: a list of freeblock objects for this page
-        - unallocated: the unallocated object for this page
-        - reserved: the reserved area for this page or None if not defined
-        - size: the page size (passed in as variable)
+    Returns:
+    - btreepage      : named tuple with the parsed btree page
     '''
-
-    # some parsing functionality work on bytes array instead of bitstream
-    bytes_ = btstr.bytes
 
     # parse the pageheader
     hoffset = offset
     if isheaderpage is True:
         hoffset += 100
-    pgheader = pageheader(bytes_, hoffset, usablepagesize)
+    pgheader = pageheader(data, hoffset, usablepagesize)
 
     # parse the cell pointer area (directly after the pageheader)
-    cpa = cellpointer_area(btstr.bytes, hoffset + pgheader.size, pgheader.cellcount)
+    cpa = cellpointer_area(data, hoffset + pgheader.size, pgheader.cellcount)
 
     # parse the cells
-    cells = [cell(btstr, bytes_, offset + cp, pgheader.pagetype,
+    cells = [cell(data, offset, cp, pgheader.pagetype,
                   usablepagesize) for cp in cpa.cellpointers]
 
     # add rowid to cell number map for this page if it is table leaf
@@ -315,56 +318,62 @@ def btree_page(btstr, offset, pagesize, usablepagesize, isheaderpage=False):
     if pgheader.pagetype == 'table_leaf':
         rowidmap = {cells[i].rowid: i for i in range(len(cells))}
 
-    # unallocated space runs from end of last cellpointer to cell content area
-    cpa_offset = hoffset + pgheader.size
+    # relative offset of unallocated space 
+    # (from end of last cellpointer to cell content area)
+    cpa_offset = hoffset + pgheader.size - offset
     cpa_size = pgheader.cellcount * 2
-    # calculate size and offset of unallocated area
+    # size of unallocated area
     usize = pgheader.cell_content_offset - (cpa_offset + cpa_size)
+    # relative offset of unallocated area
     uoffset = cpa_offset + cpa_size
-    unalloc = _block(btstr, uoffset, usize)
+    # NOTE: uoffset is relative, so need to add offset
+    unalloc = data[uoffset+offset:uoffset+usize+offset]
 
     # collect the freeblocks on this page
     fblocks = []
     fboffset = pgheader.first_freeblock_offset
     while fboffset != 0:
-        fblock = freeblock(btstr, offset + fboffset)
+        fblock = freeblock(data, offset, fboffset)
         fboffset = fblock.next_freeblock
         fblocks.append(fblock)
 
     # reserved area runs from end of cell content area to end of page
     res = None
+    res_offset = None
     if pagesize > usablepagesize:
-        res = _block(btstr, offset + usablepagesize,
-                     pagesize - usablepagesize)
+        res_offset = offset+usablepagesize
+        res = data[res_offset:offset+pagesize]
+        # make the offsets relative to page offset before returning
+        res_offset = res_offset - offset
 
-    return _btreepage(pgheader.pagetype, pgheader, cpa, cells, rowidmap,
-                      fblocks, unalloc, res, pagesize)
+    return _btreepage(pgheader.pagetype, hoffset-offset, pgheader, cpa_offset, cpa, cells,
+                      rowidmap, fblocks, uoffset, unalloc, usize, res_offset, res,
+                      pagesize)
 
 
 ####################
 # cellpointer area #
 ####################
 
+# cellpointer area fields:
+# - cellpointers: a list of cell pointers
+# - size: size of the cell pointer area
 _cellpointerarea = _nt('cellpointer_area',
                        'cellpointers size')
 
 
 def cellpointer_area(data, offset, cellcount):
-    ''' Parse given bytes as cellpointer area 
+    ''' Parse given bytes as cellpointer area
 
     Arguments:
-
     - data      : bytes containing the database header
     - offset    : offset of the dbheader structure
     - cellcount : the total number of cells to parse
 
-    Returns: 
-    - cellpointer_area: namedtuple with the following fields:
-        - cellpointers: a list of cell pointers
-        - size: size of the cell pointer area
+    Returns:
+    - cellpointer_area: namedtuple representing the cellpointer area
     '''
 
-    # parse proper amount of cell pointers
     fmt = '>' + 'H'*cellcount
     cpointers = _unpack_from(fmt, data, offset)
     # cellpointer value 0 means 65536
@@ -379,24 +388,47 @@ def cellpointer_area(data, offset, cellcount):
 ########
 
 
-def cell(btstr, bytes_, offset, pagetype, usablepagesize):
-    ''' Parses a single cell at the given offset depending on pagetype. '''
+def cell(data, page_offset, cell_offset, pagetype, usablepagesize):
+    ''' Parse given bytes as cell, depending of pagetype
+
+    Arguments:
+    - data           : bytes containing the cell
+    - page_offset    : offset of the page holding the cell structure
+    - cell_offset    : relative offset of the cell within the page
+    - pagetype       : string indicating the type of page (and thus cell type)
+    - usablepagesize : offset of reserved area within page
+
+    Returns:
+    - cell           : parsed cell, depending of pagetype
+    '''
 
     # cell structure varies for different page types
     if pagetype == 'table_leaf':
-        return _tableleaf_cell(btstr, bytes_, offset, usablepagesize)
+        return _tableleaf_cell(data, page_offset, cell_offset, usablepagesize)
     elif pagetype == 'index_leaf':
-        return _indexleaf_cell(btstr, bytes_, offset, usablepagesize)
+        return _indexleaf_cell(data, page_offset, cell_offset, usablepagesize)
     elif pagetype == 'index_interior':
-        return _indexinterior_cell(btstr, bytes_, offset, usablepagesize)
+        return _indexinterior_cell(data, page_offset, cell_offset, usablepagesize)
     elif pagetype == 'table_interior':
-        return _tableinterior_cell(btstr, bytes_, offset)
+        # NOTE: table_interior cells only store page numbers and varint integer 
+        #       key, so no overflow computation is needed, hence the absence of
+        #       the usablepagesize argument here
+        return _tableinterior_cell(data, page_offset, cell_offset)
     else:
         raise ValueError('unknown pagetype when trying to parse cells')
 
 
 def _inline_payload_size(celltype, payloadsize, usablepagesize):
-    ''' Calculates the inline size for the given payloadsize. '''
+    ''' Calculates the inline size for the given payloadsize. 
+
+    Arguments:
+    - celltype       : the type of cell
+    - payloadsize    : the size of the full payload
+    - usablepagesize : offset of reserved area within page
+
+    Returns:
+    - inlinesize     : total size of payload that can be stored inline
+    '''
 
     if celltype not in ['table', 'index']:
         raise ValueError("celltype should be 'table' or 'index'")
@@ -442,166 +474,203 @@ def _inline_payload_size(celltype, payloadsize, usablepagesize):
             return M
 
 
+# Table B-Tree Leaf Cell fields:
+# - payloadsize: total payload size, including overflow (if any)
+# - rowid: rowid of record stored in the cell
+# - first_overflow_page: page number of first overflow page
+# - inline_payload: the data stored as inline payload
+# - inline_payload_size: size of the inline payload
+# - inline_payload_offset: relative offset of the inline payload within the page
+# - cell_offset: relative offset of the cell within the page
+# - cell_size: total size of the cell (payload_size + headersize)
 _table_leaf_cell = _nt('table_leaf_cell',
                        'payloadsize rowid first_overflow_page inline_payload '
-                       'size')
+                       'inline_payload_size inline_payload_offset cell_offset '
+                       'cell_size')
 
 
-def _tableleaf_cell(btstr, bytes_, offset, usablepagesize):
-    ''' Returns a table_leaf_cell object for the bytes at the given offset.
+def _tableleaf_cell(data, page_offset, cell_offset, usablepagesize):
+    ''' Parse bytes at page_offset+cell_offset as Table B-Tree Leaf Cell
 
-    A table_leaf_cell contains the following fields:
+    Arguments:
+    - data           : bytes containing the cell
+    - page_offset    : offset of the page holding the cell structure
+    - cell_offset    : relative offset of the cell within the page
+    - usablepagesize : offset of reserved area within page
 
-        - payloadsize: the size of all payload, including overflow
-        - rowid: rowid of the cell
-        - first_overflow_page: page number of first overflow page (or None)
-        - inline_payload: the inline part of the payload
-        - offset: offset of the cell within the bitstream
-        - size: size of the cell within the bitstream
+    Returns:
+    - cell           : parsed cell
     '''
 
+    offset = page_offset + cell_offset
+
     # table B-Tree leaf cell starts with payloadsize and rowid
-    payloadsize, payloadsize_width = varint(bytes_, offset)
-    rowid, rowid_width = varint(bytes_, offset + payloadsize_width)
+    payloadsize, payloadsize_width = varint(data, offset)
+    rowid, rowid_width = varint(data, offset + payloadsize_width)
 
     # determine dimensions and location of inline payload
     ipsize = _inline_payload_size('table', payloadsize, usablepagesize)
     payloadstart = payloadsize_width + rowid_width
+    # create slice for inline payload
+    ipstart = payloadstart + offset
+    ipend = ipstart + ipsize
+    payload = data[ipstart:ipend]
 
-    # set inline payload block
-    payload = _block(btstr, offset + payloadstart, ipsize)
-
-    # determine size of the cell structure so far
+    # determine size of the cell structure thus far
     cellsize = payloadsize_width + rowid_width + ipsize
 
     # if the payload overflows, we need to read first overflow page pointer
     fop = None
     if payloadsize > ipsize:
         # read 4 byte integer for first overflow page (fop)
-        storepos = btstr.bytepos
-        btstr.bytepos = offset + cellsize
-        fop = btstr.read('uintbe:32')
-        btstr.bytepos = storepos
+        fop = _unpack_from('>I', data, offset + cellsize)[0]
         cellsize += 4
 
-    return _table_leaf_cell(payloadsize, rowid, fop, payload, cellsize)
+    return _table_leaf_cell(payloadsize, rowid, fop, payload, ipsize, ipstart-page_offset, cell_offset, cellsize)
 
 
+# Table B-Tree Interior Cell fields:
+# - left_child_pointer: left child pointer (pagenumber)
+# - key: integer key
+# - cell_offset: relative offset of the cell within the page
+# - cell_size: size of the cell
 _table_interior_cell = _nt('table_interior_cell',
-                           'left_child_pointer key size')
+                           'left_child_pointer key cell_offset cell_size')
 
 
-def _tableinterior_cell(btstr, bytes_, offset):
-    ''' Returns a table_interior_cell object for the bytes at the given offset.
+def _tableinterior_cell(data, page_offset, cell_offset):
+    ''' Parse bytes at page_offset+cell_offset as Table B-Tree Interior Cell
 
-    A table_interior_cell contains the following fields:
+    Arguments:
+    - data      : bytes containing the cell
+    - page_offset    : offset of the page holding the cell structure
+    - cell_offset    : relative offset of the cell within the page
 
-        - left_child_pointer: left child pointer (pagenumber)
-        - key: integer key
-        - size: size of the cell
+    Returns:
+    - cell      : parsed table interior cell
     '''
+
+    offset = page_offset + cell_offset
 
     # read left child pointer
-    storepos = btstr.bytepos
-    btstr.bytepos = offset
-    lcp = btstr.read('uintbe:32')
-    btstr.bytepos = storepos
+    lcp = _unpack_from('>I', data, offset)[0]
     # read the varint key
-    key, key_width = varint(bytes_, offset + 4)
+    key, key_width = varint(data, offset + 4)
     cellsize = 4 + key_width
-    return _table_interior_cell(lcp, key, cellsize)
+    return _table_interior_cell(lcp, key, cell_offset, cellsize)
 
 
+# Index B-Tree Leaf Cell fields:
+# - payloadsize: total payload size, including overflow (if any)
+# - first_overflow_page: page number of first overflow page
+# - inline_payload: the data stored as inline payload
+# - inline_payload_size: size of the inline payload
+# - inline_payload_offset: relative offset of the inline payload within the page
+# - cell_offset: relative offset of the cell within the page
+# - cell_size: total size of the cell (payload_size + headersize)
 _index_leaf_cell = _nt('index_leaf_cell',
                        'payloadsize first_overflow_page inline_payload '
-                       'size')
+                       'inline_payload_size inline_payload_offset '
+                       'cell_offset cell_size')
 
 
-def _indexleaf_cell(btstr, bytes_, offset, usablepagesize):
-    ''' Returns an index_leaf_cell object for the bytes at the given offset.
+def _indexleaf_cell(data, page_offset, cell_offset, usablepagesize):
+    ''' Parse bytes at page_offset+cell_offset as Index B-Tree Leaf Cell 
 
-    An index_leaf_cell contains the following fields:
+    Arguments:
+    - data           : bytes containing the cell
+    - page_offset    : offset of the page holding the cell structure
+    - cell_offset    : relative offset of the cell within the page
+    - usablepagesize : offset of reserved area within page
 
-        - payloadsize: the total payloadsize, including overflow
-        - first_overflow_page: page number of first overflow page (or None)
-        - inline_payload: the inline part of the payload
-        - size: size of the cell within the bitstream
+    Returns:
+    - cell           : parsed cell
     '''
 
+    offset = page_offset + cell_offset
+
     # index B-Tree leaf cell starts with payloadsize
-    payloadsize, payloadsize_width = varint(bytes_, offset)
+    payloadsize, payloadsize_width = varint(data, offset)
 
     # determine dimensions and location of inline payload
     ipsize = _inline_payload_size('index', payloadsize, usablepagesize)
     payloadstart = payloadsize_width
 
-    # define inline payload block
-    payload = _block(btstr, offset + payloadstart, ipsize)
+    # create slice for inline payload
+    ipstart = payloadstart + offset
+    ipend = ipstart + ipsize
+    payload = data[ipstart:ipend]
 
     # determine size of the cell structure so far
     cellsize = payloadsize_width + ipsize
 
     # if the payload overflows, we need to read first overflow page pointer
-    slack, overflowpages, fop = (None, ) * 3
+    fop = None
     if payloadsize > ipsize:
         # read 4 byte integer for first overflow page (fop)
-        storepos = btstr.bytepos
-        btstr.bytepos = offset + cellsize
-        fop = btstr.read('uintbe:32')
-        btstr.bytepos = storepos
+        fop = _unpack_from('>I', data, offset + cellsize)[0]
         cellsize += 4
 
-    return _index_leaf_cell(payloadsize, fop, payload, cellsize)
+    return _index_leaf_cell(payloadsize, fop, payload, ipsize, ipstart-page_offset, cell_offset, cellsize)
 
 
+# Index B-Tree Interior Cell fields:
+# - left_child_pointer: left child pointer (pagenumber)
+# - payloadsize: total payload size, including overflow (if any)
+# - first_overflow_page: page number of first overflow page
+# - inline_payload: the data stored as inline payload
+# - inline_payload_size: size of the inline payload
+# - inline_payload_offset: relative offset of the inline payload within the page
+# - cell_offset: relative offset of the cell within the page
+# - cell_size: total size of the cell (payload_size + headersize)
 _index_interior_cell = _nt('index_interior_cell',
                            'left_child_pointer payloadsize '
                            'first_overflow_page inline_payload '
-                           'size')
+                           'inline_payload_size inline_payload_offset '
+                           'cell_offset cell_size')
 
 
-def _indexinterior_cell(btstr, bytes_, offset, usablepagesize):
-    ''' Returns an index_interior_cell object for bytes at given offset.
+def _indexinterior_cell(data, page_offset, cell_offset, usablepagesize):
+    ''' Parse bytes at page_offset+cell_offset as Index B-Tree Interior Cell 
 
-    An index_interior_cell contains the following fields:
+    Arguments:
+    - data           : bytes containing the cell
+    - page_offset    : offset of the page holding the cell structure
+    - cell_offset    : relative offset of the cell within the page
+    - usablepagesize : offset of reserved area within page
 
-        - left_child_pointer: left child pointer (pagenumber)
-        - payloadsize: the total payloadsize, including overflow
-        - first_overflow_page: page number of first overflow page (or None)
-        - inline_payload: the inline part of the payload
-        - size: size of the cell within the bitstream
+    Returns:
+    - cell           : parsed cell
     '''
 
-    # read left child pointer
-    storepos = btstr.bytepos
-    btstr.bytepos = offset
-    lcp = btstr.read('uintbe:32')
-    btstr.bytepos = storepos
+    offset = page_offset + cell_offset
 
-    # index B-Tree interior cell has payloadsize at offset 4
-    payloadsize, payloadsize_width = varint(bytes_, offset + 4)
+    # read left child pointer
+    lcp = _unpack_from('>I', data, offset)[0]
+
+    # index B-Tree interior cell has key payloadsize at offset 4
+    payloadsize, payloadsize_width = varint(data, offset + 4)
 
     # determine dimensions and location of inline payload
     ipsize = _inline_payload_size('index', payloadsize, usablepagesize)
     payloadstart = payloadsize_width + 4
 
-    # define inline payload block
-    payload = [_block(btstr, offset + payloadstart, ipsize)]
+    # create slice for inline payload
+    ipstart = payloadstart + offset
+    ipend = ipstart + ipsize
+    payload = data[ipstart:ipend]
 
-    # determine size of the cell so far
+    # determine size of the cell thus far
     cellsize = payloadsize_width + ipsize + 4
 
     # if the payload overflows, we need to read first overflow page pointer
-    slack, overflowpages, fop = (None, ) * 3
+    fop = None
     if payloadsize > ipsize:
         # read 4 byte integer for first overflow page (fop)
-        storepos = btstr.bytepos
-        btstr.bytepos = offset + cellsize
-        fop = btstr.read('uintbe:32')
-        btstr.bytepos = storepos
+        fop = _unpack_from('>I', data, offset + cellsize)[0]
         cellsize += 4
 
-    return _index_interior_cell(lcp, payloadsize, fop, payload, cellsize)
+    return _index_interior_cell(lcp, payloadsize, fop, payload, ipsize, ipstart-page_offset, cell_offset, cellsize)
 
 
 ##########
@@ -698,7 +767,7 @@ def varints(bytes_, offset, bytecount, limit=None, maxwidth=9):
 
 
 def tovarint(number):
-    ''' Creates a bitstream object with the given number as varint. '''
+    ''' Creates a bytes object with the given number as varint. '''
 
     if number >= 2**64:
         raise ValueError('max varint is 2**64-1')
@@ -723,36 +792,39 @@ def tovarint(number):
         count += 1
         upper = 0x80
 
-    return _BS(uintbe=val, length=count*8)
+    return int.to_bytes(val, count, 'big', signed=False)
 
 
 #################
 # record format #
 #################
 
+# recordformat fields:
+# - header: the parsed record header
+# - body: the parsed record body
 _recordformat = _nt('recordformat', 'header body')
 
+# NOTE: offset is not stored intentionally in the parsed header and body, since
+# we may also pass in slices of data which makes the offset relative to the
+# slice, making the offset useless without keeping track of the slice of data
+# passed into the function. The caller is responsible for tracking the offset
+# of the data
 
-def recordformat(btstr, offset):
-    ''' Returns a recordformat object by parsing data in given bitstream
 
-    A recordformat object consists of the following fields:
+def recordformat(data, offset):
+    ''' Parse given bytes as recordformat (header + body)
 
-        - header: a recordheader object
-        - body: a list of column data fields as one of 5 storage classes
+    Arguments:
+    - data     : bytes containing the recordformat structure
+    - offset   : offset of the recordformat structure
 
-    The payload is a list of blocks in the given bitstream that together
-    describe the location of the payload.
-
-    TEXT and BLOB values are currently fully expanded in the returned object.
-    This can be a problem when stored TEXT or BLOB values are very large.
+    Returns:
+    - recordformat : namedtuple with the parsed recordheader + body
     '''
 
-    bytes_ = btstr.bytes
-
-    recheader = recordheader(bytes_, offset)
+    recheader = recordheader(data, offset)
     bodyoffset = recheader.headersize + offset
-    body = recordbody(btstr, bodyoffset, recheader)
+    body = recordbody(data, bodyoffset, recheader)
     return _recordformat(recheader, body)
 
 
@@ -760,19 +832,25 @@ def recordformat(btstr, offset):
 # record header #
 #################
 
+# recordheader fields:
+# - headersize : the size of the header in bytes
+# - serialtypes : a sequence of serialtypes as stored in the header
 _recordheader = _nt('recordheader', 'headersize serialtypes')
 
 
-def recordheader(bytes_, offset):
-    ''' Parses the bytes at given offset as recordheader.
+def recordheader(data, offset):
+    ''' Parse given bytes as recordheader
 
-    A recordheader object consists of the following fields:
-        - headersize: the size of the header in the given bitstream
-        - serialtypes: a list of serialtype numbers
+    Arguments:
+    - data     : bytes containing the recordheader structure
+    - offset   : offset of the recordheader structure
+
+    Returns:
+    - recordheader : sequence of serialtype numbers
     '''
 
     # parse and unpack headersize varint (value, varint_width)
-    hsize, skip = varint(bytes_, offset)
+    hsize, skip = varint(data, offset)
 
     # default max number of columns is 2000 and each column may take
     # up to 5 bytes in record header (varint of 5 bytes is enough for
@@ -784,7 +862,7 @@ def recordheader(bytes_, offset):
     types_offset = offset+skip
     types_bytecount = hsize-skip
 
-    serialtypes = varints(bytes_, types_offset, types_bytecount)
+    serialtypes = varints(data, types_offset, types_bytecount)
     # this function returns tuples, consisting of (varint_value, varint_width) pairs
     serialtypes = [i[0] for i in serialtypes]
 
@@ -798,7 +876,12 @@ def recordheader(bytes_, offset):
 # serialtype #
 ##############
 
-_serialtype = _nt('serialtype', 'size storageclass parser')
+# serialtype fields:
+# - size : the size of the serialtype in the recordbody
+# - storageclass: NULL, Integer, Real, Text or Blob
+# - parser: format string for struct.unpack
+# - function: post processing function to apply after struct.unpack
+_serialtype = _nt('serialtype', 'size storageclass parser function')
 
 # SQLite uses these 5 storage classes
 _null = _nt('null', 'size value')
@@ -807,31 +890,32 @@ _real = _nt('real', 'size value')
 _text = _nt('text', 'size value')
 _blob = _nt('blob', 'size value')
 
+# intbe24 and intbe48 need to be converted separately (and similarly)
+_int24 = lambda b: int.from_bytes(b, 'big', signed=True)
+_int48 = lambda b: int.from_bytes(b, 'big', signed=True)
+
 # The fixed-width types and the corresponding parser instruction
-_fixedtypes = {0: _serialtype(0, _null, None),
-               1: _serialtype(1, _integer, 'intbe:8'),
-               2: _serialtype(2, _integer, 'intbe:16'),
-               3: _serialtype(3, _integer, 'intbe:24'),
-               4: _serialtype(4, _integer, 'intbe:32'),
-               5: _serialtype(6, _integer, 'intbe:48'),
-               6: _serialtype(8, _integer, 'intbe:64'),
-               7: _serialtype(8, _real, 'floatbe:64'),
-               8: _serialtype(0, _integer, None),
-               9: _serialtype(0, _integer, None)}
+_fixedtypes = {0: _serialtype(0, _null, None, None),
+               1: _serialtype(1, _integer, 'b', None),    # signed int8
+               2: _serialtype(2, _integer, 'h', None),    # signed int16
+               3: _serialtype(3, _integer, '3s', _int24), # signed int24
+               4: _serialtype(4, _integer, 'i', None),    # signed int32
+               5: _serialtype(6, _integer, '6s', _int48), # signed int48
+               6: _serialtype(8, _integer, 'q', None),    # signed int64
+               7: _serialtype(8, _real, 'd', None),       # float64
+               8: _serialtype(0, _integer, None, None),
+               9: _serialtype(0, _integer, None, None)}
 
 
 def serialtype(stype):
-    ''' returns a serialtype object based on the given typecode
+    ''' Return serialtype namedtuple based on numeric serial type
 
-    These properties are fully determined by the serialtype and are needed
-    to determine the column value either by parsing bytes in the body or by
-    using one of the fixed values (None, 0 or 1).
+    Arguments:
+    - stype    : numeric serial type
 
-    Returnvalue: tuple of (size, storageclass, parsecommand)
-
-    - size is the amount of bytes occupied in the body by the column
-    - storageclass is one of the 5 storage classes
-    - parsecommand is a string containing an instruction for the parser. '''
+    Returns:
+    - serialtype : namedtuple with serialtype properties
+    '''
 
     if stype in [10, 11]:
         raise ValueError('reserved serialtype 10 or 11 encountered')
@@ -842,11 +926,11 @@ def serialtype(stype):
     elif stype >= 12 and stype % 2 == 0:
         # BLOB of length (N-12) / 2
         size = int((stype - 12) / 2)
-        return _serialtype(size, _blob, 'bytes:%d' % (size,))
+        return _serialtype(size, _blob, f'{size}s', None)
     elif stype >= 13 and stype % 2 == 1:
         # STRING of length (N-13) / 2
         size = int((stype - 13) / 2)
-        return _serialtype(size, _text, 'bytes:%d' % (size,))
+        return _serialtype(size, _text, f'{size}s', None)
     else:
         return _fixedtypes[stype]
 
@@ -856,12 +940,19 @@ def serialtype(stype):
 ###############
 
 
-def recordbody(btstr, offset, recheader):
+def recordbody(data, offset, recheader):
     ''' Parses the recordbody at given offset based on given recordheader.
 
-    Returns a list of storage class objects for the various objects. Some
-    serial types are not stored in the body, but are determined by the header.
-    These have size 0. The following serial types are defined:
+    Arguments:
+    - data      : the data in which the recordbody exists
+    - offset    : the offset of the recordbody in given data
+    - recheader : the parsed recordheader with parser instructions
+
+    Returns:
+    - body: Llist of storage class objects for the various objects. 
+
+    Note: Some serial types are not stored in the body, but are determined by the 
+    header. These have size 0. The following serial types are defined:
 
         - null: used for NULL column values
         - integer: used for INTEGER column values
@@ -879,15 +970,19 @@ def recordbody(btstr, offset, recheader):
     stypes = [serialtype(t) for t in recheader.serialtypes]
     sizes = [s[0] for s in stypes]
     sclasses = [s[1] for s in stypes]
-    plist = [s[2] for s in stypes]
-    pcommand = ','.join([p for p in plist if p is not None])
 
-    # read data from bitstream and restore position
-    storepos = btstr.pos
-    btstr.pos = offset * 8
-    parsedcolumns = btstr.readlist(pcommand)
-    btstr.pos = storepos
-
+    # build the parse instruction (big-endian)
+    fmt = '>' + ''.join([s.parser for s in stypes if s.parser is not None])
+    # int24 and int48 need post-processing
+    pfuncs = [s.function for s in stypes if s.parser is not None]
+    # parse the bytes
+    parsed = list(_unpack_from(fmt, data, offset))
+    # apply function to selected fields
+    for idx, func in enumerate(pfuncs):
+        if func is None:
+            continue
+        else:
+            parsed[idx] = func(parsed[idx])
     # add the non-space-consuming column values in the appropriate slots
     columns = []
     for i in range(len(recheader.serialtypes)):
@@ -901,7 +996,7 @@ def recordbody(btstr, offset, recheader):
         elif tc == 9:
             val = 1
         else:
-            val = parsedcolumns.pop(0)
+            val = parsed.pop(0)
         columns.append(sclass(size, val))
     return columns
 
@@ -910,50 +1005,64 @@ def recordbody(btstr, offset, recheader):
 # freeblock #
 #############
 
+# fields:
+# - next_freeblock : relative offset of next freeblock within page
+# - offset         : relative offset of this freeblock within page
+# - size           : size of the current freeblock
+# - data           : bytes stored in the freeblock (excluding header)
 _freeblock = _nt('freeblock', 'next_freeblock offset size block')
 
 
-def freeblock(btstr, offset):
-    ''' Interprets bytes at offset as freeblock.
+def freeblock(data, page_offset, freeblock_offset):
+    ''' Parse data at page_offset+freeblock_offset as freeblock
 
-    A freeblock contains the following fields:
+    Arguments:
+    - data             : bytes containing the cell
+    - page_offset      : offset of the page holding the cell structure
+    - freeblock_offset : relative offset of the cell within the page
 
-        - next_freeblock : pointer to next freeblock in chain
-        - offset: the offset of the freeblock
-        - size: the freeblock size, including the header
-        - block: a block object containing the freeblock data
+    Returns:
+    - freeblock        : parsed freeblock
     '''
 
-    # store current position
-    oldpos = btstr.bytepos
-    # move to start of freeblock
-    btstr.bytepos = offset
     # read next freeblock pointer and freeblocksize
-    next_fb, size = btstr.readlist('uintbe:16, uintbe:16')
-    # restore pos
-    btstr.bytepos = oldpos
+    next_fb, size = _unpack_from('>HH', data, freeblock_offset + page_offset)
     # define a block for the data area
-    fbdata = _block(btstr, offset + 4, size - 4)
-    return _freeblock(next_fb, offset, size, fbdata)
+    start = freeblock_offset+page_offset+4
+    end = start+size-4
+    fbdata = data[start:end]
+    return _freeblock(next_fb, freeblock_offset, size, fbdata)
 
 
 ################
 # overflowpage #
 ################
 
-_overflowpage = _nt('overflowpage', 'next_overflow_page payload '
-                                    'reserved offset')
+
+# overflow page fields:
+# - pagetype: 'overflow'
+# - next_overflow_page: pagenumber of next overflowpage or 0 (eoc)
+# - payload: bytes with the payload
+# - payload_size: size of the payload (usablePageSize-4)
+# - reserved_offset: relative offset of the reserved area (usablepagesize)
+# - reserved: the data stored in the reserved area for this page or None
+# - size: the page size (passed in as variable)
+_overflowpage = _nt('overflowpage', 'pagetype next_overflow_page payload '
+                                    'payload_size reserved_offset '
+                                    'reserved size')
 
 
-def overflowpage(btstr, offset, pagesize, usablepagesize):
-    ''' Parses a page as overflowpage, returning an overflowpage object.
+def overflowpage(data, offset, pagesize, usablepagesize):
+    ''' Parses data at given offset as overflowpage.
 
-    An overflowpage contains the following fields:
+    Arguments:
+    - data           : bytes containing the overflow page
+    - offset         : offset of the page within the data
+    - pagesize       : the size of a database page
+    - usablepagesize : start of the reserved area withing the page
 
-        - next_overflow_page: pagenumber of next overflowpage or 0 (eoc)
-        - payload: a block object containing the payload data function
-        - reserved: the reserved area as block object or None
-        - offset: the offset of the overflowpage
+    Returns:
+    - overflowpage  : a parsed overflow page
 
     Note that the last overflow page in a chain may not completely contain
     payload data. In other words, there may be slack in the chained overflow
@@ -964,129 +1073,182 @@ def overflowpage(btstr, offset, pagesize, usablepagesize):
     '''
 
     # read the next overflowpage pagenumber and restore btstr position
-    storepos = btstr.bytepos
-    btstr.bytepos = offset
-    next_overflow_page = btstr.read('uintbe:32')
-    btstr.bytepos = storepos
+    next_overflow_page = _unpack_from('>I', data, offset)[0]
+
+    # btree.c, line 5175:
+    #    const u32 ovflSize = pBt->usableSize - 4;  /* Bytes content per ovfl page */
+
+    # From this we learn that overflow pages also have a reserved area (if used)
+    # and that the size of the overflow on a page is limited to usableSize minus 4 for 
+    # the small header with the next overflow page
 
     # payload and reserved area
-    payload = _block(btstr, offset + 4, usablepagesize - 4)
-    # reserved area
-    res = None
-    if pagesize > usablepagesize:
-        res = _block(btstr, offset + usablepagesize,
-                         pagesize - usablepagesize)
+    start = offset + 4
+    psize = usablepagesize - 4
+    end = start + psize
+    payload = data[start:end]
 
-    return _overflowpage(next_overflow_page, payload, res, offset)
+    # reserved area runs from end of cell content area to end of page
+    res = None
+    res_offset = None
+    if pagesize > usablepagesize:
+        res_offset = offset+usablepagesize
+        res = data[res_offset:offset+pagesize]
+        # make the offsets relative to page offset before returning
+        res_offset = res_offset - offset
+
+    return _overflowpage('overflow', next_overflow_page, payload, psize, res_offset, res, pagesize)
 
 
 #######################
 # freelist trunk page #
 #######################
 
+# When a page ends up on the freelist, it either becomes a freelisttrunk page
+# or a freelistleafpage. In the first case, parts of the page are overwritten.
+# In the second case, the entire page is left as is, and it is merely made
+# unreachable from the original position (either since the overflow pointers to
+# the page are no longer valid, or because the page is removed from some btree.
 
+# freelist trunk page fields:
+# - pagetype: 'freelist_trunk'
+# - nextfreelisttrunkpage: pagenumber of next freelist trunk page or 0 (eoc)
+# - leafpointercount: total number of leaf pointers on this page
+# - freelistleafpointers: pagenumbers of the freelist leaf pages
+# - unallocated_offset: relative offset of the unallocated space
+# - unallocated: the data stored in the unallocated area for this page
+# - unallocated_size : size of the unallocated space
+# - reserved_offset: relative offset of the reserved area (usablepagesize)
+# - reserved: the data stored in the reserved area for this page or None
+# - size: the page size (passed in as variable)
 _freelisttrunkpage = _nt('freelisttrunkpage',
-                         'nextfreelisttrunkpage leafpointercount '
-                         'freelistleafpointers unallocated reserved')
+                         'pagetype nextfreelisttrunkpage leafpointercount '
+                         'freelistleafpointers unallocated_offset unallocated '
+                         'unallocated_size reserved_offset reserved size')
 
 
-def freelisttrunkpage(btstr, offset, pagesize, usablepagesize):
-    ''' Parses the page at the given offset as freelist trunk page.
+def freelisttrunkpage(data, offset, pagesize, usablepagesize):
+    ''' Parses data at given offset as freelist trunk page.
 
-    A freelist trunkpage contains the following fields:
+    Arguments:
 
-        - nextfreelisttrunkpage: page number of the next freelist trunk page
-        - leafpointercount: amount of pointers to freelist leaf pages.
-        - freelistleafpointers: list of pointers to freelist leaf pages.
-        - unallocated: unallocated space within the freelist trunk page.
-        - reserved: the reserved space within the freelist trunk page.
+    - data           : bytes containing the overflow page
+    - offset         : offset of the page within the data
+    - pagesize       : the size of a database page
+    - usablepagesize : start of the reserved area withing the page
+
+    Returns:
+    - freelisttrunkpage : parsed freelist trunk page
     '''
 
     # leafpointers are 4 bytes wide
     lpsize = 4
 
-    # read the fields
-    storepos = btstr.bytepos
-    btstr.bytepos = offset
+    nextfreelisttrunkpage, leafpointercount = _unpack_from('>II', data, offset)
 
-    nextfreelisttrunkpage = btstr.read('uintbe:32')
-    leafpointercount = btstr.read('uintbe:32')
-
-    # NOTE: not sure if it should it be >= or >
-    if leafpointercount * lpsize + 2 * lpsize >= usablepagesize:
+    # Check if the leafpointers fit in the usable pagesize
+    if (8 + leafpointercount * lpsize) > usablepagesize:
         raise ValueError('page cannot hold that many leafpointers')
 
-    flpointers = btstr.readlist('uintbe:32, ' * leafpointercount)
-
-    # calculate and check current position in page
-    fpstart = 8 + offset
+    fpstart = offset + 8
     fpend = fpstart + leafpointercount * lpsize
-    if btstr.bytepos != fpend:
-        raise ValueError('bytepos inconsistency')
 
-    # reset pointer
-    btstr.bytepos = storepos
+    fmt = '>' + 'I' * leafpointercount
+    flpointers = _unpack_from(fmt, data, fpstart)
 
-    # define unallocated and reserved blocks
-    unallocated = _block(btstr, fpend, offset + usablepagesize - fpend)
-    reserved = _block(btstr, offset + usablepagesize,
-                          pagesize - usablepagesize)
+    # unallocated area is between pointers and reserved area
+    unallocated = data[fpend:offset+usablepagesize]
 
-    return _freelisttrunkpage(nextfreelisttrunkpage, leafpointercount,
-                              flpointers, unallocated, reserved)
+    # reserved area runs from end of cell content area to end of page
+    res = None
+    res_offset = None
+    if pagesize > usablepagesize:
+        res_offset = offset+usablepagesize
+        res = data[res_offset:offset+pagesize]
+        # make the offsets relative to page offset before returning
+        res_offset = res_offset - offset
+
+    return _freelisttrunkpage('freelist_trunk', nextfreelisttrunkpage, 
+                              leafpointercount, flpointers, fpend-offset, unallocated, 
+                              usablepagesize-fpend, res_offset, res, pagesize)
 
 
 ######################
 # freelist leaf page #
 ######################
 
-_freelistleafpage = _nt('freelistleafpage', 'unallocated reserved')
+# freelist leaf page fields:
+# - pagetype: 'freelist_leaf'
+# - unallocated_offset: relative offset of the unallocate space (0)
+# - unallocated: the data stored in the unallocated area for this page
+# - unallocated_size : size of the unallocated space
+# - reserved_offset: relative offset of the reserved area (usablepagesize)
+# - reserved: the data stored in the reserved area for this page or None
+# - size: the page size (passed in as variable)
+_freelistleafpage = _nt('freelistleafpage',
+                        'pagetype unallocated_offset unallocated '
+                        'unallocated_size reserved_offset reserved size')
 
 
-def freelistleafpage(btstr, offset, pagesize, usablepagesize):
-    ''' Returns a freelistleafpage object.
+def freelistleafpage(data, offset, pagesize, usablepagesize):
+    ''' Parses data at given offset as freelist leaf page.
 
-    A freelist leafpage contains the following fields:
+    Arguments:
 
-        - unallocated: unallocated space within the freelist trunk page.
-        - reserved: the reserved space within the freelist trunk page.
+    - data           : bytes containing the overflow page
+    - offset         : offset of the page within the data
+    - pagesize       : the size of a database page
+    - usablepagesize : start of the reserved area withing the page
 
-    When a page ends up on the freelist, it either becomes a freelisttrunk page
-    or a freelistleafpage. In the first case, parts of the page are
-    overwritten. In the second case, the entire page is left as is, and it is
-    merely made unreachable from the original position (either since the
-    overflow pointers to the page are no longer valid, or because the page is
-    removed from some btree.
+    Returns:
+    - freelistleafpage : parsed freelist leaf page
     '''
 
-    # define unallocated and reserved blocks
-    unallocated = _block(btstr, offset, usablepagesize)
-    reserved = _block(btstr, offset + usablepagesize,
-                          pagesize - usablepagesize)
+    # define all up to reserved area as unallocated
+    unallocated = data[offset:offset+usablepagesize]
+    # reserved area runs from end of cell content area to end of page
+    res = None
+    res_offset = None
+    if pagesize > usablepagesize:
+        res_offset = offset+usablepagesize
+        res = data[res_offset:offset+pagesize]
+        # make the offsets relative to page offset before returning
+        res_offset = res_offset - offset
 
-    return _freelistleafpage(unallocated, reserved)
+    return _freelistleafpage('freelist_leaf', 0, unallocated, 
+                             usablepagesize, res_offset, res, pagesize)
 
 
 ################
 # generic page #
 ################
 
-_genericpage = _nt('genericpage', 'unallocated')
+# a basic page that treats all data as unallocated
+
+# generic page fields:
+# - pagetype: 'unknown'
+# - unallocated_offset: relative offset of the unallocate space (0)
+# - unallocated: the data stored in the unallocated area for this page
+# - unallocated_size : size of the unallocated space
+# - size: the page size (passed in as variable)
+_genericpage = _nt('genericpage', 'pagetype unallocated_offset unallocated '
+                                  'unallocated_size size')
 
 
-def genericpage(btstr, offset, pagesize):
-    ''' Returns a genericpage object.
+def genericpage(data, offset, pagesize):
+    ''' Parses data at given offset as generic (unallocated) page.
 
-    An genericpage that can be used for pages that originate from various
-    sources, such as superseded pages for which a more recent version exists
-    in a WAL file, or from pages carved from memory dumps, for example. It
-    treats the entire page a single unallocated area
+    Arguments:
+
+    - data           : bytes containing the page
+    - offset         : offset of the page within the data
+    - pagesize       : the size of a database page
+
+    Returns:
+    - genericpage     : 'parsed' generic page
     '''
-
-    # define unallocated and reserved blocks
-    unallocated = _block(btstr, offset, pagesize)
-
-    return _genericpage(unallocated)
+    return _genericpage('unknown', 0, data[offset:offset+pagesize], 
+                        pagesize, pagesize)
 
 
 ##################
