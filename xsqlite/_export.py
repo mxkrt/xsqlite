@@ -53,6 +53,14 @@ def insert_statements(db, tablename):
     records = (tbl.viewer.user_view(r) for r in db.rowidrecords(tbl.rootpage))
     for r in records:
         vals = [stringlify(v, 'NULL') for v in r.values.values()]
+        # When columns are added via ALTER TABLE ADD COLUMN, records can be
+        # stored with less columns than the current column count. In older
+        # records (prior to the ALTER TABLE) the column values default to the
+        # default value (often NULL).
+        missing_columns = len(tbl.columns) - len(vals)
+        if missing_columns > 0:
+            for c in tbl.columns[-missing_columns:]:
+                vals.append(stringlify(c.default, 'NULL'))
         yield template.format(','.join(vals))
 
 
