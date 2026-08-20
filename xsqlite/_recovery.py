@@ -354,16 +354,16 @@ class Freeblock():
 
 
 class Unallocated():
-    ''' wrapper for unallocated area within a btree page, with some extra meta-data '''
+    ''' wrapper for unallocated area within a page, with some extra meta-data '''
 
-    def __init__(s, unallocated, pagenumber=None, pageoffset=None, pagesource=None):
+    def __init__(s, data, offset, pagenumber=None, pageoffset=None, pagesource=None):
         ''' initialize Unallocated object, optionally setting pagenumber and pageoffset '''
 
+        s.data = data           # bytes with the unallocated data
+        s.data_offset = offset  # relative offset of the data within the page
+        s.size = len(s.data)
         s.header_offset = None
-        s.data_offset = unallocated.offset
-        s.size = unallocated.size
         s.data_size = s.size
-        s.data = unallocated.data()
         s.pageoffset = pageoffset
         s.pagenumber = pagenumber
         s.pagesource = pagesource
@@ -531,7 +531,8 @@ def _unallocated_walker(db, rootpagenumber):
 
     pages = db.treewalker(rootpagenumber)
     for page in pages:
-        yield Unallocated(page.page.unallocated, page.pagenumber, page.pageoffset, page.pagesource)
+
+        yield Unallocated(page.page.unallocated, page.page.unallocated_offset, page.pagenumber, page.pageoffset, page.pagesource)
 
 
 def _freespace_walker(db, rootpagenumber):
@@ -1294,7 +1295,7 @@ def _scan_freelist_for_varints(db, varint_count, rootpage_for_testing=None):
         if hasattr(p.page, 'nextfreelisttrunkpage'):
             # this is a freelisttrunk page, consisting of a small header, freelistleafpointers,
             # and an unallocated area. Search the unallocated area for varint sequences
-            free_area = Unallocated(p.page.unallocated, pagenumber, pageoffset, pagesource)
+            free_area = Unallocated(p.page.unallocated, p.page.unallocated_offset, pagenumber, pageoffset, pagesource)
             for offset, varints, stypes in _varint_scanner(free_area.data.bytes, varint_count):
                 yield free_area, offset, varints, stypes
             # move on to next page
@@ -1308,7 +1309,7 @@ def _scan_freelist_for_varints(db, varint_count, rootpage_for_testing=None):
         except:
             # this is not a btree page, treat as a single unallocated area and scan
             # for varint sequences in the entire page
-            free_area = Unallocated(pagedata, pagenumber, pageoffset, pagesource)
+            free_area = Unallocated(pagedata, 0, pagenumber, pageoffset, pagesource)
             for offset, varints, stypes in _varint_scanner(free_area.data.bytes, varint_count):
                 yield free_area, offset, varints, stypes
             # move on to next page
@@ -1339,7 +1340,7 @@ def _scan_freelist_for_varints(db, varint_count, rootpage_for_testing=None):
                 yield free_area, offset, varints, stypes
 
         # Finally, scan the unallocated area of the parsed btree page
-        free_area = Unallocated(parsed.unallocated, pagenumber, pageoffset, pagesource)
+        free_area = Unallocated(parsed.unallocated, parsed.unallocated_offset, pagenumber, pageoffset, pagesource)
         for offset, varints, stypes in _varint_scanner(free_area.data.bytes, varint_count):
             yield free_area, offset, varints, stypes
 
@@ -1369,7 +1370,7 @@ def _scan_superseded_pages_for_varints(db, varint_count):
         except:
             # this is not a btree page, treat as a single unallocated area and scan
             # for varint sequences in the entire page
-            free_area = Unallocated(pagedata, pagenumber, pageoffset, pagesource)
+            free_area = Unallocated(pagedata, 0, pagenumber, pageoffset, pagesource)
             for offset, varints, stypes in _varint_scanner(free_area.data.bytes, varint_count):
                 yield free_area, offset, varints, stypes
             # move on to next page
@@ -1400,7 +1401,7 @@ def _scan_superseded_pages_for_varints(db, varint_count):
                 yield free_area, offset, varints, stypes
 
         # Finally, scan the unallocated area of the parsed btree page
-        free_area = Unallocated(parsed.unallocated, pagenumber, pageoffset, pagesource)
+        free_area = Unallocated(parsed.unallocated, parsed.unallocated_offset, pagenumber, pageoffset, pagesource)
         for offset, varints, stypes in _varint_scanner(free_area.data.bytes, varint_count):
             yield free_area, offset, varints, stypes
 
@@ -1428,7 +1429,7 @@ def _scan_outdated_pages_for_varints(db, varint_count):
         except:
             # this is not a btree page, treat as a single unallocated area and scan
             # for varint sequences in the entire page
-            free_area = Unallocated(pagedata, pagenumber, pageoffset, pagesource)
+            free_area = Unallocated(pagedata, 0, pagenumber, pageoffset, pagesource)
             for offset, varints, stypes in _varint_scanner(free_area.data.bytes, varint_count):
                 yield free_area, offset, varints, stypes
             # move on to next page
@@ -1459,7 +1460,7 @@ def _scan_outdated_pages_for_varints(db, varint_count):
                 yield free_area, offset, varints, stypes
 
         # Finally, scan the unallocated area of the parsed btree page
-        free_area = Unallocated(parsed.unallocated, pagenumber, pageoffset, pagesource)
+        free_area = Unallocated(parsed.unallocated, parsed.unallocated_offset, pagenumber, pageoffset, pagesource)
         for offset, varints, stypes in _varint_scanner(free_area.data.bytes, varint_count):
             yield free_area, offset, varints, stypes
 
@@ -1472,7 +1473,7 @@ def _scan_wal_slack_for_varints(db, varint_count):
     pagesource = _database.PageSource.WALFile
 
     # treat as a single unallocated area and scan for varint sequences
-    free_area = Unallocated(slackdata, None, pageoffset, pagesource)
+    free_area = Unallocated(slackdata, 0, None, pageoffset, pagesource)
     for offset, varints, stypes in _varint_scanner(free_area.data.bytes, varint_count):
         yield free_area, offset, varints, stypes
         # move on to next page
@@ -2216,7 +2217,7 @@ def _allocated_scan(db, tablename, recov_params, max_drop_reason=RejectReason.Lo
             yield _scan_result(c, rh)
 
 
-def _freelist_scan(db, tablename, recov_params, 
+def _freelist_scan(db, tablename, recov_params,
                    max_drop_reason=RejectReason.LooseObservedSignature, debug=False):
     ''' scan through freelist pages to generate (candidate, recordheader) tuples
     '''
