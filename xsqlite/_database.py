@@ -57,34 +57,12 @@ class Database():
             raise ValueError("expected filename, mmapped file or file-like object")
 
         if wal is not None:
-            if isinstance(wal, str):
-                # open and mmap the file and parse as WalFile
-                walfilename = _path.abspath(_path.expanduser(wal))
-                if _stat(walfilename).st_size != 0:
-                    wfile = open(walfilename, 'rb')
-                    wfile_mmap = _mmap.mmap(wfile.fileno(), 0, access=_mmap.ACCESS_READ)
-                    s.walfile = WalFile(walfilename, wfile_mmap)
-            elif isinstance(wal, _mmap.mmap):
-                # we already have an mmapped file, parse as WalFile
-                s.walfile = WalFile(None, wal)
-            elif hasattr(wal, 'read') and hasattr(wal, 'seek'):
-                # a file-like-object, mmap and parse as WalFile
-                wfile_mmap = _mmap.mmap(wal.fileno(), 0, access=_mmap.ACCESS_READ)
-                s.walfile = WalFile(None, wfile_mmap)
-            else:
-                raise ValueError("expected filename, mmapped file or file-like object")
+            s.walfile = WalFile(wal)
         else:
             # check if a WAL file exists in the same directory as the main db file
             if s.filename is not None:
-                dirname = _path.dirname(s.filename)
-                basename = _path.basename(s.filename)
-                walpath = _path.join(dirname, basename+'-wal')
-                if _path.exists(walpath):
-                    walfilename = walpath
-                    if _stat(walfilename).st_size != 0:
-                        wfile = open(walfilename, 'rb')
-                        wfile_mmap = _mmap.mmap(wfile.fileno(), 0, access=_mmap.ACCESS_READ)
-                        s.walfile = WalFile(walfilename, wfile_mmap)
+                if _path.exists(s.filename+'-wal'):
+                    s.walfile = WalFile(s.filename+'-wal')
 
         if journal is not None:
             if isinstance(journal, str):

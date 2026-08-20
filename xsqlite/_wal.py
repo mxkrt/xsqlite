@@ -7,6 +7,9 @@ Copyright (c) 2025-2026 mxkrt@lsjam.nl - MIT License
 from struct import unpack as _unpack
 from collections import namedtuple as _nt
 from struct import unpack_from as _unpack_from
+import os.path as _path
+import mmap as _mmap
+from os import stat as _stat
 
 from . import _exceptions
 from . import _structures
@@ -45,11 +48,34 @@ class WalFile():
     frames within the WAL are valid and which are leftovers from prior
     checkpoints.  '''
 
-    def __init__(s, filename, mmapped_file):
-        ''' initialize a WAL file object from the given mmapped file '''
+    def __init__(s, file):
+        ''' initialize a WAL file object from the given file
 
-        s.filename = filename
-        s.data = mmapped_file
+        Arguments:
+        - file : a filename, a file-like object or an mmapped file
+
+        Returns:
+        - WalFile : initialized WALFile object
+        '''
+
+        if isinstance(file, str):
+            # open and mmap the file and parse as WalFile
+            s.filename = _path.realpath(_path.expanduser(file))
+            if _stat(s.filename).st_size != 0:
+                wfile = open(s.filename, 'rb')
+                s.data = _mmap.mmap(wfile.fileno(), 0, access=_mmap.ACCESS_READ)
+            else:
+                print(f"[!] WalFile {s.filename} has size 0, ignored!")
+        elif isinstance(file, _mmap.mmap):
+            # we already have an mmapped file
+            s.filename = None
+            s.data = file
+        elif hasattr(file, 'read') and hasattr(file, 'seek'):
+            # a file-like-object, mmap
+            s.filename = None
+            s.data = _mmap.mmap(file.fileno(), 0, access=_mmap.ACCESS_READ)
+        else:
+            raise ValueError("expected filename, mmapped file or file-like object")
 
         # wal file size
         s.filesize = s.data.size()
