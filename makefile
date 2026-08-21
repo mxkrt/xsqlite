@@ -10,6 +10,7 @@ help:
 	@echo "  make purge       - remove ~/.virtualenvs/xsqlite"
 	@echo "  make dev_install - create editable install in ~/.virtualenvs/xsqlite_dev"
 	@echo "  make dev_purge   - remove ~/.virtualenvs/xsqlite_dev"
+	@echo "  make test_db     - generate a test database in current working dir"
 	@echo "  make clean       - remove temporary files from working dir"
 
 .PHONY: install
@@ -28,7 +29,6 @@ uninstall:
 	@echo "Uninstalling from virtualenv ~/.virtualenvs/xsqlite"
 	@. ~/.virtualenvs/xsqlite/bin/activate && pip3 uninstall xsqlite
 	@echo
-
 
 .PHONY: purge
 purge:
@@ -51,7 +51,15 @@ dev_purge:
 	@echo "removing virtualenv ~/.virtualenvs/xsqlite_dev"
 	rm -rf ~/.virtualenvs/xsqlite_dev
 
+.PHONY: test_db
+test_db:
+	@echo "generating test database in current workgin dir"
+	python3 ./xsqlite/test/make_test_db.py
+
 .PHONY: clean
 clean:
 	rm -rf build
 	rm -rf xsqlite.egg-info
+	rm -f xsqlite_test.db
+	rm -f xsqlite_test.log
+	rm -f xsqlite_test_with_wal.db*

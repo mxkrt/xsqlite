@@ -1,2 +1,7 @@
 *.pyc
 __pycache__
+xsqlite_test.db
+xsqlite_test.log
+xsqlite_test_with_wal.db
+xsqlite_test_with_wal.db-shm
+xsqlite_test_with_wal.db-wal
