@@ -9,6 +9,6 @@ Copyright (c) 2025-2026 mxkrt@lsjam.nl - MIT License
 #######
 
 from ._database import Database
-from ._recovery import determine_recovery_parameters
+from ._table_analysis import determine_recovery_parameters
 from ._recovery import recover_records
 from ._recovery import recover_table
