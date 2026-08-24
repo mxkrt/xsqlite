@@ -9,7 +9,6 @@ from collections import Counter as _Counter
 from struct import pack as _pack
 import statistics as _statistics
 from enum import Enum as _Enum
-#import bitstring as _bitstring
 import re as _re
 from itertools import chain as _chain
 
@@ -55,7 +54,11 @@ def recover_records(db, tablename, recov_params, max_drop_reason=RejectReason.Lo
 
     g = _scan(db, tablename, recov_params)
     for candidate in g:
-        res = RecoveredRecord(candidate)
+        try:
+            res = RecoveredRecord(candidate)
+        except _exceptions.NotYetImplementedException:
+            print("[!] skipped partial record")
+            pass
         yield res
 
 
@@ -80,6 +83,9 @@ def recover_to_xlsx(db, tablename, recov_params, outfile, include_allocated):
     ''' recover the given table to the given outfile '''
 
     tbl = db.tables[tablename]
+
+    if not outfile.endswith('.xlsx'):
+        outfile = f"{outfile}.xlsx"
 
     with _export.XLSXWriter(outfile) as x:
 
@@ -310,9 +316,20 @@ class UnallocatedCell():
 # This sections contains functions that walk over types of free spaces within
 # a database file
 
-
 def _freeblock_walker(db, rootpagenumber):
-    ''' Generates sequence of all freeblocks within the btree starting at rootpagenumber '''
+    ''' Generates sequence of all freeblocks within the btree starting at rootpagenumber
+
+    NOTE: this generator only visits the ALLOCATED btree, so if any page has
+    been superseded by a page in the WAL, the freeblocks in the old version of
+    the page are not yielded.
+
+    Arguments:
+    - db        : database object
+    - rootpage  : start iteration of the btree at given pagenumber
+
+    Yields:
+    - Freeblock : simple wrapper around a parsed freeblock
+    '''
 
     pages = db.treewalker(rootpagenumber)
     for page in pages:
@@ -779,7 +796,7 @@ def _scan_btree_allocated_for_varints(db, rootpagenumber, varint_count):
     '''
 
     for alloc in _allocated_walker(db, rootpagenumber):
-        for offset, varints, stypes in _varint_scanner(alloc.data.bytes, varint_count):
+        for offset, varints, stypes in _varint_scanner(alloc.data, varint_count):
             yield alloc, offset, varints, stypes
 
 
@@ -806,7 +823,7 @@ def _scan_freelist_for_varints(db, varint_count, rootpage_for_testing=None):
             # this is a freelisttrunk page, consisting of a small header, freelistleafpointers,
             # and an unallocated area. Search the unallocated area for varint sequences
             free_area = Unallocated(p.page.unallocated, p.page.unallocated_offset, pagenumber, pageoffset, pagesource)
-            for offset, varints, stypes in _varint_scanner(free_area.data.bytes, varint_count):
+            for offset, varints, stypes in _varint_scanner(free_area.data, varint_count):
                 yield free_area, offset, varints, stypes
             # move on to next page
             continue
@@ -820,7 +837,7 @@ def _scan_freelist_for_varints(db, varint_count, rootpage_for_testing=None):
             # this is not a btree page, treat as a single unallocated area and scan
             # for varint sequences in the entire page
             free_area = Unallocated(pagedata, 0, pagenumber, pageoffset, pagesource)
-            for offset, varints, stypes in _varint_scanner(free_area.data.bytes, varint_count):
+            for offset, varints, stypes in _varint_scanner(free_area.data, varint_count):
                 yield free_area, offset, varints, stypes
             # move on to next page
             continue
@@ -838,7 +855,7 @@ def _scan_freelist_for_varints(db, varint_count, rootpage_for_testing=None):
                 cell = parsed.cells[cellno]
                 free_area = FreelistCell(cell, pagenumber, pageoffset, cellno, pagesource)
                 # scan the freelist cell for varints
-                for offset, varints, stypes in _varint_scanner(free_area.data.bytes, varint_count):
+                for offset, varints, stypes in _varint_scanner(free_area.data, varint_count):
                     yield free_area, offset, varints, stypes
 
         # If we get here, we have either a table_leaf or table_interior page parsed from the
@@ -846,12 +863,12 @@ def _scan_freelist_for_varints(db, varint_count, rootpage_for_testing=None):
         # Next, scan the freeblocks for varints
         for freeblock in parsed.freeblocks:
             free_area = Freeblock(freeblock, pagenumber, pageoffset, pagesource)
-            for offset, varints, stypes in _varint_scanner(free_area.data.bytes, varint_count):
+            for offset, varints, stypes in _varint_scanner(free_area.data, varint_count):
                 yield free_area, offset, varints, stypes
 
         # Finally, scan the unallocated area of the parsed btree page
         free_area = Unallocated(parsed.unallocated, parsed.unallocated_offset, pagenumber, pageoffset, pagesource)
-        for offset, varints, stypes in _varint_scanner(free_area.data.bytes, varint_count):
+        for offset, varints, stypes in _varint_scanner(free_area.data, varint_count):
             yield free_area, offset, varints, stypes
 
 
@@ -881,7 +898,7 @@ def _scan_superseded_pages_for_varints(db, varint_count):
             # this is not a btree page, treat as a single unallocated area and scan
             # for varint sequences in the entire page
             free_area = Unallocated(pagedata, 0, pagenumber, pageoffset, pagesource)
-            for offset, varints, stypes in _varint_scanner(free_area.data.bytes, varint_count):
+            for offset, varints, stypes in _varint_scanner(free_area.data, varint_count):
                 yield free_area, offset, varints, stypes
             # move on to next page
             continue
@@ -899,7 +916,7 @@ def _scan_superseded_pages_for_varints(db, varint_count):
                 cell = parsed.cells[cellno]
                 free_area = UnallocatedCell(cell, pagenumber, pageoffset, cellno, pagesource)
                 # scan the unallocated cell for varints
-                for offset, varints, stypes in _varint_scanner(free_area.data.bytes, varint_count):
+                for offset, varints, stypes in _varint_scanner(free_area.data, varint_count):
                     yield free_area, offset, varints, stypes
 
         # If we get here, we have either a table_leaf or table_interior page.
@@ -907,12 +924,12 @@ def _scan_superseded_pages_for_varints(db, varint_count):
         # Next, scan the freeblocks for varints
         for freeblock in parsed.freeblocks:
             free_area = Freeblock(freeblock, pagenumber, pageoffset, pagesource)
-            for offset, varints, stypes in _varint_scanner(free_area.data.bytes, varint_count):
+            for offset, varints, stypes in _varint_scanner(free_area.data, varint_count):
                 yield free_area, offset, varints, stypes
 
         # Finally, scan the unallocated area of the parsed btree page
         free_area = Unallocated(parsed.unallocated, parsed.unallocated_offset, pagenumber, pageoffset, pagesource)
-        for offset, varints, stypes in _varint_scanner(free_area.data.bytes, varint_count):
+        for offset, varints, stypes in _varint_scanner(free_area.data, varint_count):
             yield free_area, offset, varints, stypes
 
 
@@ -940,7 +957,7 @@ def _scan_outdated_pages_for_varints(db, varint_count):
             # this is not a btree page, treat as a single unallocated area and scan
             # for varint sequences in the entire page
             free_area = Unallocated(pagedata, 0, pagenumber, pageoffset, pagesource)
-            for offset, varints, stypes in _varint_scanner(free_area.data.bytes, varint_count):
+            for offset, varints, stypes in _varint_scanner(free_area.data, varint_count):
                 yield free_area, offset, varints, stypes
             # move on to next page
             continue
@@ -958,7 +975,7 @@ def _scan_outdated_pages_for_varints(db, varint_count):
                 cell = parsed.cells[cellno]
                 free_area = UnallocatedCell(cell, pagenumber, pageoffset, cellno, pagesource)
                 # scan the unallocated cell for varints
-                for offset, varints, stypes in _varint_scanner(free_area.data.bytes, varint_count):
+                for offset, varints, stypes in _varint_scanner(free_area.data, varint_count):
                     yield free_area, offset, varints, stypes
 
         # If we get here, we have either a table_leaf or table_interior page.
@@ -966,12 +983,12 @@ def _scan_outdated_pages_for_varints(db, varint_count):
         # Next, scan the freeblocks for varints
         for freeblock in parsed.freeblocks:
             free_area = Freeblock(freeblock, pagenumber, pageoffset, pagesource)
-            for offset, varints, stypes in _varint_scanner(free_area.data.bytes, varint_count):
+            for offset, varints, stypes in _varint_scanner(free_area.data, varint_count):
                 yield free_area, offset, varints, stypes
 
         # Finally, scan the unallocated area of the parsed btree page
         free_area = Unallocated(parsed.unallocated, parsed.unallocated_offset, pagenumber, pageoffset, pagesource)
-        for offset, varints, stypes in _varint_scanner(free_area.data.bytes, varint_count):
+        for offset, varints, stypes in _varint_scanner(free_area.data, varint_count):
             yield free_area, offset, varints, stypes
 
 
@@ -984,7 +1001,7 @@ def _scan_wal_slack_for_varints(db, varint_count):
 
     # treat as a single unallocated area and scan for varint sequences
     free_area = Unallocated(slackdata, 0, None, pageoffset, pagesource)
-    for offset, varints, stypes in _varint_scanner(free_area.data.bytes, varint_count):
+    for offset, varints, stypes in _varint_scanner(free_area.data, varint_count):
         yield free_area, offset, varints, stypes
         # move on to next page
         continue
@@ -1660,7 +1677,7 @@ _scan_result = _nt('scan_result', 'varint_candidate recordheader')
 def _native_btree_scan(db, tablename, recov_params, max_drop_reason=RejectReason.LooseObservedSignature):
     ''' generate sequence of (candidate, recordheader) tuples for given table from its own btree '''
 
-    # search for varint sequences in the
+    # search for varint sequences in the free area in the current btree
     varint_candidates = _varint_scan_native_btree(db, tablename, recov_params)
     # filter by comparing to the various signatures in the recovery parameters
     filtered_candidates = _filter_varint_candidates(varint_candidates, recov_params)
@@ -1959,29 +1976,38 @@ class RecoveredRecord:
             s.is_partial = False
             s.last_column_is_truncated = False
             return
-        except _bitstring.ReadError as e:
-            if not e.args[0].startswith('Reading off the end of the data'):
+        except Exception as e:
+            if not e.args[0].startswith('unpack_from requires a buffer of at least'):
                 raise
 
         # if we get here, we could not parse the full record, but we can try to
         # read a partial record
 
+        raise _exceptions.NotYetImplementedException("Record reconstruction is being rewritten") 
+
         # first parse the recordheader
-        bytes_ = bstream.bytes
+        bytes_ = bstream
         recheader = _structures.recordheader(bytes_, 0)
         body_offset = recheader.headersize
 
         # make list of sizes, storageclases and a parser command from serialtypes
         stypes = [_structures.serialtype(t) for t in recheader.serialtypes]
+        print(stypes)
         sizes = [s[0] for s in stypes]
         sclasses = [s[1] for s in stypes]
         plist = [s[2] for s in stypes]
+        print(plist)
 
         # increment columns and keep reading until we encounter our read error
         for i in range(len(plist)+1):
+            # TODO: in current approach I keep adding fields until parsing fails,
+            #       turn this arround, strip off fields at the end untial parsing
+            #       no longer fails
+
             # prepare the parse command for less columns
-            pcommand = ','.join([p for p in plist[:i] if p is not None])
+            pcommand = '>' + ''.join([p for p in plist[:i] if p is not None])
             # move to the start of the body in the bitstream (bit offset)
+            print(pcommand)
             bstream.pos = body_offset * 8
             try:
                 bstream.readlist(pcommand)
