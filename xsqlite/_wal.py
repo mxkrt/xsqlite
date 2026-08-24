@@ -13,6 +13,7 @@ from os import stat as _stat
 
 from . import _exceptions
 from . import _structures
+from ._page import Page, PageSource
 
 
 def walchecksum(integers, s0=0, s1=0):
