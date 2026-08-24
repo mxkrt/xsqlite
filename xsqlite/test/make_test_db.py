@@ -75,7 +75,7 @@ def generate_testdb():
         # delete 200 consequetive records in an attempt to create freelist pages
         for id_ in range(120,220):
             cur.execute(f"DELETE FROM table_one WHERE id = {id_}")
-            log.write(f'DELETE:\ttable_one\t{id_}\n')
+            log.write(f'DELETE:\ttable_one\trecord_{id_}\n')
 
         con.commit()
         log.write(f'[commit]\n')
@@ -103,7 +103,7 @@ def generate_testdb():
         for i in range(0, 200):
             id_ = random.randint(300,15000)
             cur.execute(f"DELETE FROM table_one WHERE id = {id_}")
-            log.write(f'DELETE:\ttable_one\t{id_}\n')
+            log.write(f'DELETE:\ttable_one\trecord_{id_}\n')
 
         con.commit()
         log.write(f'[commit]\n')
@@ -111,7 +111,7 @@ def generate_testdb():
         # delete 100 consequetive records in an attempt to create freelist pages
         for id_ in range(7720,7820):
             cur.execute(f"DELETE FROM table_one WHERE id = {id_}")
-            log.write(f'DELETE:\ttable_one\t{id_}\n')
+            log.write(f'DELETE:\ttable_one\trecord_{id_}\n')
 
         con.commit()
         log.write(f'[commit]\n')
