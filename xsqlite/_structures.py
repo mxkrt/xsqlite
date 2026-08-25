@@ -10,6 +10,7 @@ of the database format as given on: https://www.sqlite.org/fileformat.html
 from struct import unpack_from as _unpack_from
 from collections import namedtuple as _nt
 
+from ._varint import varint, varints
 
 ###################
 # database header #
@@ -670,127 +671,6 @@ def _indexinterior_cell(data, page_offset, cell_offset, usablepagesize):
     return _index_interior_cell(lcp, payloadsize, fop, cell_offset, ipstart,
                                 cellsize, payload)
 
-
-##########
-# varint #
-##########
-
-
-def varint(bytes_, offset, maxwidth=9):
-    ''' Read a single varint form the given bytes_ at given offset
-
-    The maxwidth argument is added to prevent reading very large varints, which
-    is only realistic for the rowid of tables with many rows or for columns that
-    contain very large TEXT or BLOB values. A value of 5 seems a reasonable max
-    when parsing recordheader serialtypes.
-
-    However, when maxwidth is not 9, the decoding of varints dictates that
-    the upperbit of the last byte must be 0. Otherwise the varint decoder
-    would proceed and try to read another byte. So in this case we raise a
-    ValueError
-
-    Returnvalue is the varint value and it's width in bytes
-    '''
-
-    # read and decode the varint
-    value = 0
-    for idx in range(0, maxwidth):
-        # read a byte
-        val = bytes_[offset+idx]
-        upperbit = val >> 7
-        if idx == 8:
-            # all bits of the 9th byte are included
-            value = value << 8
-            value += val
-        else:
-            # only the lower 7 bits of the byte are included
-            value = value << 7
-            value += val & 0x7f
-        if upperbit == 0:
-            # stop when the upperbit is zero
-            break
-        elif idx == (maxwidth - 1) and idx != 8:
-            # The upperbit dictates that we should read another
-            # byte, but this would exceed the given maxwidth.
-            # Thus, this would lead to an incorrectly parsed varint
-            raise ValueError("given maxwidth prevents proper parsing of varint")
-        if idx > 8:
-            break
-
-    # return varint and width
-    return value, idx+1
-
-
-def varints(bytes_, offset, bytecount, limit=None, maxwidth=9):
-    ''' Interprets bytecount bytes at given offset as varints.
-
-    Returns a list of varint values. When limit is set, decoding varints
-    is aborted after 'limit' varints have been found. Raises an exception if
-    the last varint that has been read exceeds the bytecount boundary.  The maxwidth
-    argument is passed onto the varint function to limit the width of each individual
-    varint to this maximum, which is usefull when parsing recordheader serialtypes
-    '''
-
-    if bytecount <= 0:
-        return []
-
-    pos = offset
-    endpos = offset + bytecount
-
-    # check if amount of bytes is available
-    if endpos > len(bytes_):
-        raise ValueError('not enough bytes available')
-
-
-    results = []
-    while True:
-        if len(results) == limit:
-            # stop if we have read enough varints
-            break
-
-        if pos == endpos:
-            # stop if we have read the desired amount of bytes
-            break
-
-        if pos > endpos:
-            # the last varint has moved us beyond desired amount of bytes
-            raise ValueError("last varint required reading extra bytes")
-
-        # read the varint and append to the list
-        value, width = varint(bytes_, pos, maxwidth)
-        results.append((value, width))
-        pos += width
-
-    return results
-
-
-def tovarint(number):
-    ''' Creates a bytes object with the given number as varint. '''
-
-    if number >= 2**64:
-        raise ValueError('max varint is 2**64-1')
-
-    val = 0
-    count = 0
-    upper = 0
-
-    if number >= 2**56:
-        # need all 9 bytes, lower is full
-        val = number & 0xff
-        number >>= 8
-        count = 1
-        upper = 0x80
-    elif number == 0:
-        val = 0
-        count = 1
-
-    while count < 9 and number > 0:
-        val += (number & 0x7f | upper) << count * 8
-        number >>= 7
-        count += 1
-        upper = 0x80
-
-    return int.to_bytes(val, count, 'big', signed=False)
 
 
 #################

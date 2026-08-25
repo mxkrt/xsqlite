@@ -23,6 +23,7 @@ from . import _exceptions
 from . import _export
 from . import _database
 
+from ._varint import tovarint as _tovarint
 
 
 def determine_recovery_parameters(db, tablename, minimal_record_count=30, ignore_last_cols=None):
@@ -203,7 +204,7 @@ def determine_recovery_parameters(db, tablename, minimal_record_count=30, ignore
     # make sure we only have to create these size varints once
     headersizes = _OD()
     for size in range(min_headersize, max_headersize + 1):
-        headersizes[size] = _structures.tovarint(size)
+        headersizes[size] = _tovarint(size)
 
     # the recordheader can contain 1 varint for each column + headersize
     max_varints_in_header = len(tbl.columns) + 1
