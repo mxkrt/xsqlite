@@ -55,7 +55,7 @@ _table_leaf_cell = _nt('table_leaf_cell',
                        'inline_payload')
 
 
-# Index B-Tree Interior Cell fields:
+# namedtuple representing a parsed Index B-Tree Interior Cell
 # - left_child_pointer: left child pointer (pagenumber)
 # - payloadsize: total payload size, including overflow (if any)
 # - first_overflow_page: page number of first overflow page
@@ -70,7 +70,7 @@ _index_interior_cell = _nt('index_interior_cell',
                            'inline_payload')
 
 
-# Index B-Tree Leaf Cell fields:
+# namedtuple representing a parsed Index B-Tree Leaf Cell
 # - payloadsize: total payload size, including overflow (if any)
 # - first_overflow_page: page number of first overflow page
 # - cell_offset: relative offset of the cell within the page
@@ -81,6 +81,15 @@ _index_leaf_cell = _nt('index_leaf_cell',
                        'payloadsize first_overflow_page '
                        'cell_offset inline_payload_offset cell_size '
                        'inline_payload')
+
+
+# namedtuple representing a parsed Freeblocks
+# - offset         : relative offset of this freeblock within page
+# - next_freeblock : relative offset of next freeblock within page
+# - size           : size of the current freeblock
+# - data_offset    : offset of data in page freeblock (offset+4)
+# - get_bytes      : bytes stored in the freeblock (incl. header)
+_freeblock = _nt('freeblock', 'offset next_freeblock size data_offset get_bytes')
 
 
 class Page():
@@ -142,31 +151,10 @@ class BtreePage(Page):
         # the cellpointers are directly after the header
         s.cell_pointers_offset = s.header_offset + s.headersize
 
-        # TODO: consider to make this a function in the API instead
-        #       of pre-parsing (both cell_pointers as cells).
+        # the size of the cell pointer area (a cell pointer is two bytes wide)
+        s.cell_pointers_size = s.cell_count * 2
 
-        # parse the cell pointer area (directly after the pageheader)
-        s._parse_cell_pointers()
-
-        # parse the cells, depending on pagetype
-        if s.pagetype == PageType.TableBtreeInterior:
-            s.cells = [s._parse_table_interior_cell(cp) for cp in
-                       s.cell_pointers]
-
-        elif s.pagetype == PageType.TableBtreeLeaf:
-            s.cells = [s._parse_table_leaf_cell(cp) for cp in
-                       s.cell_pointers]
-            # add a mapping from rowid to cell_number for convenience
-            s.rowidmap = {s.cells[i].rowid: i for i in range(len(s.cells))}
-
-        elif s.pagetype == PageType.IndexBtreeInterior:
-            s.cells = [s._parse_index_interior_cell(cp) for cp in
-                       s.cell_pointers]
-
-        elif s.pagetype == PageType.IndexBtreeLeaf:
-            s.cells = [s._parse_index_leaf_cell(cp) for cp in
-                       s.cell_pointers]
-
+        # TODO: 
         # TODO: next step is to parse the freeblocks
         # collect the freeblocks on this page
         ##fblocks = []
@@ -179,6 +167,47 @@ class BtreePage(Page):
 
         # initialize superclass
         super().__init__()
+
+
+    def cells(s):
+        ''' API function to return list of cells '''
+
+        if hasattr(s, "_cells"):
+            return s._cells
+
+        # parse the cells, depending on pagetype
+        if s.pagetype == PageType.TableBtreeInterior:
+            s._cells = [s._parse_table_interior_cell(cp) for cp in s.cell_pointers()]
+            return s._cells
+
+        elif s.pagetype == PageType.TableBtreeLeaf:
+            s._cells = [s._parse_table_leaf_cell(cp) for cp in s.cell_pointers()]
+            # add a mapping from rowid to cell_number for convenience
+            s._rowidmap = {c.rowid: idx for idx,c in enumerate(s.cells())}
+            s.max_rowid = max(s._rowidmap.keys())
+            s.min_rowid = min(s._rowidmap.keys())
+            return s._cells
+
+        elif s.pagetype == PageType.IndexBtreeInterior:
+            s._cells = [s._parse_index_interior_cell(cp) for cp in s.cell_pointers()]
+            return s._cells
+
+        elif s.pagetype == PageType.IndexBtreeLeaf:
+            s._cells = [s._parse_index_leaf_cell(cp) for cp in s.cell_pointers()]
+            return s._cells
+
+
+    def cell_by_rowid(s, rowid):
+        ''' API function to return cell for given rowid '''
+
+        if s.pagetype != PageType.TableBtreeLeaf:
+            raise ValueError("only Table Btree Leaf pags have cells with rowids")
+
+        if not hasattr(s, "_rowidmap"):
+            # initialize by parsing the cells
+            s.cells()
+
+        return s._rowidmap[rowid]
 
 
     def _parse_pageheader(s):
@@ -211,6 +240,7 @@ class BtreePage(Page):
         # cellcount: number of cells on this page.
         s.cell_count = parsed[2]
 
+
         # cell_content_offset: relative offset of cell content area.
         cellarea = parsed[3]
         # in some fields (including this one), value 0 means 65536
@@ -240,18 +270,20 @@ class BtreePage(Page):
             raise ValueError('free byte count exceeds cell content area size.')
 
 
-    def _parse_cell_pointers(s):
+    def cell_pointers(s):
         ''' Parse the cellpointer area of the BtreePage '''
+
+        if hasattr(s, '_cell_pointers'):
+            return s._cell_pointers
 
         # offset is relative to page offset
         offset = s.offset + s.cell_pointers_offset
 
         fmt = '>' + 'H' * s.cell_count
         cpointers = _unpack_from(fmt, s.data, offset)
-        # cell pointer is two bytes wide
-        s.cell_pointers_size = s.cell_count * 2
         # cellpointer value 0 means 65536
-        s.cell_pointers = [65536 if p == 0 else p for p in cpointers]
+        s._cell_pointers = [65536 if p == 0 else p for p in cpointers]
+        return s._cell_pointers
 
 
     def _inline_payload_size(s, payloadsize):
@@ -435,6 +467,22 @@ class BtreePage(Page):
 
         return _index_leaf_cell(payloadsize, fop, cell_offset, ipstart,
                                 cellsize, payload)
+
+
+    def _parse_freeblock(s, fb_offset):
+        ''' Parse data at given offset as freeblock ''' 
+
+        # offset is relative to page offset
+        offset = s.offset + fb_offset
+
+        # read next freeblock pointer and freeblocksize
+        next_fb, size = _unpack_from('>HH', s.data, offset)
+        
+        def get_bytes():
+            ''' returns the data for this freeblock as bytes, excluding header '''
+            return s.data[offset:offset+size]
+
+        return _freeblock(fb_offset, next_fb, size, fb_offset+4, get_bytes)
 
 
 # btree page fields:
