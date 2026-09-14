@@ -58,6 +58,16 @@ class Page():
             raise ValueError("Page: unallocated_offset not initialized")
         if not hasattr(s, "unallocated_size"):
             raise ValueError("Page: unallocated_size not initialized")
+        if not hasattr(s, "usablepagesize"):
+            raise ValueError("Page: usablepage_size not initialized")
+
+        # reserved area runs from usablepagesize to end of page
+        # for all page types
+        s.reserved_offset = None
+        s.reserved_size = None
+        if s.size > s.usablepagesize:
+            s.reserved_offset = s.usablepagesize
+            s.reserved_size = s.size - s.usablepagesize
 
 
     def get_bytes(s):
@@ -161,43 +171,38 @@ class BtreePage(Page):
         s.unallocated_offset = s.cell_pointers_offset + s.cell_pointers_size
         s.unallocated_size = s.cell_content_offset - s.unallocated_offset
 
-        # reserved area runs from end of cell content area to end of page
-        s.reserved_offset = None
-        s.reserved_size = None
-        if pagesize > usablepagesize:
-            s.reserved_offset = usablepagesize
-            s.reserved_size = pagesize - usablepagesize
+        # parse the cell pointers, which sets the following properties
+        # of the BtreePage instance: s.cell_pointers
+        s._parse_cell_pointers()
+
+        # parse the cells, which sets the following properties of
+        # the BtreePage instance: s.cells and for TableBtreeLeaf pages:
+        # s.rowidmap, s.max_rowid, s.min_rowid
+        s._parse_cells()
 
         # initialize superclass
         super().__init__()
 
 
-    def cells(s):
-        ''' API function to return list of cells '''
-
-        if hasattr(s, "_cells"):
-            return s._cells
+    def _parse_cells(s):
+        ''' Parse the cells in the current Btree Page '''
 
         # parse the cells, depending on pagetype
         if s.pagetype == PageType.TableBtreeInterior:
-            s._cells = [s._parse_table_interior_cell(cp) for cp in s.cell_pointers()]
-            return s._cells
+            s.cells = [s._parse_table_interior_cell(cp) for cp in s.cell_pointers]
 
         elif s.pagetype == PageType.TableBtreeLeaf:
-            s._cells = [s._parse_table_leaf_cell(cp) for cp in s.cell_pointers()]
+            s.cells = [s._parse_table_leaf_cell(cp) for cp in s.cell_pointers]
             # add a mapping from rowid to cell_number for convenience
-            s.rowidmap = {c.rowid: idx for idx,c in enumerate(s.cells())}
+            s.rowidmap = {c.rowid: idx for idx,c in enumerate(s.cells)}
             s.max_rowid = max(s.rowidmap.keys())
             s.min_rowid = min(s.rowidmap.keys())
-            return s._cells
 
         elif s.pagetype == PageType.IndexBtreeInterior:
-            s._cells = [s._parse_index_interior_cell(cp) for cp in s.cell_pointers()]
-            return s._cells
+            s.cells = [s._parse_index_interior_cell(cp) for cp in s.cell_pointers]
 
         elif s.pagetype == PageType.IndexBtreeLeaf:
-            s._cells = [s._parse_index_leaf_cell(cp) for cp in s.cell_pointers()]
-            return s._cells
+            s.cells = [s._parse_index_leaf_cell(cp) for cp in s.cell_pointers]
 
 
     def cell_by_rowid(s, rowid):
@@ -206,13 +211,10 @@ class BtreePage(Page):
         if s.pagetype != PageType.TableBtreeLeaf:
             raise ValueError("only Table Btree Leaf pags have cells with rowids")
 
-        if not hasattr(s, "rowidmap"):
-            # initialize by parsing the cells
-            s.cells()
-
         if not rowid in s.rowidmap:
             raise ValueError(f"No allocated record with ROWID {rowid} on this page")
-        return s._cells[s.rowidmap[rowid]]
+
+        return s.cells[s.rowidmap[rowid]]
 
 
     def _parse_pageheader(s):
@@ -274,11 +276,8 @@ class BtreePage(Page):
             raise ValueError('free byte count exceeds cell content area size.')
 
 
-    def cell_pointers(s):
+    def _parse_cell_pointers(s):
         ''' Parse the cellpointer area of the BtreePage '''
-
-        if hasattr(s, '_cell_pointers'):
-            return s._cell_pointers
 
         # offset is relative to page offset
         offset = s.offset + s.cell_pointers_offset
@@ -286,8 +285,7 @@ class BtreePage(Page):
         fmt = '>' + 'H' * s.cell_count
         cpointers = _unpack_from(fmt, s._data, offset)
         # cellpointer value 0 means 65536
-        s._cell_pointers = [65536 if p == 0 else p for p in cpointers]
-        return s._cell_pointers
+        s.cell_pointers = [65536 if p == 0 else p for p in cpointers]
 
 
     def _inline_payload_size(s, payloadsize):
@@ -546,3 +544,105 @@ class BtreePage(Page):
             fb_offset = fblock.next_freeblock
             s._freeblocks.append(fblock)
         return s._freeblocks
+
+
+##################
+# FreeList Pages #
+##################
+
+# When a page ends up on the freelist, it either becomes a freelisttrunk page
+# or a freelistleafpage. In the first case, parts of the page are overwritten.
+# In the second case, the entire page is left as is, and it is merely made
+# unreachable from the allocated structures (btree or overflowpage pointers)
+
+
+class FreeListTrunkPage(Page):
+    ''' Class representing a Freelist Trunk Page '''
+
+    def __init__(s, data, offset, pagenum, pagesize, pagesource, usablepagesize):
+        ''' initialize a FreeListTrunkPAge from given data at given offset
+
+        Arguments:
+        - data           : data containing the page at given offset
+        - offset         : offset of the page structure
+        - pagenum        : the pagenumber (derived from offset or wal frame)
+        - pagesize       : the size of the page (derived from database header)
+        - pagesource     : PageSource value (DatabaseFile or WalFile)
+        - usablepagesize : usable page size as calculated from database header
+        '''
+
+        s._data = data
+        s.offset = offset
+        s.size = pagesize
+        s.pagenum = pagenum
+        s.pagesource = pagesource
+        s.usablepagesize = usablepagesize
+
+        s.pagetype = PageType.FreelistTrunk
+
+        # leafpointers are 4 bytes wide
+        lpsize = 4
+
+        # parse the page header
+        parsed = _unpack_from('>II', s._data, s.offset)
+        # nextfreelisttrunkpage: pagenumber of next freelist trunk page or 0 (eoc)
+        s.nextfreelisttrunkpage = parsed[0]
+        # leafpointercount: total number of leaf pointers on this page
+        s.leafpointercount = parsed[1]
+
+        # Check if the leafpointers fit in the usable pagesize as a sanitycheck
+        if (8 + s.leafpointercount * lpsize) > s.usablepagesize:
+            raise ValueError('page cannot hold that many leafpointers')
+
+        # parse the leafpointers
+        fpstart = s.offset + 8
+        fmt = '>' + 'I' * s.leafpointercount
+        # freelistleafpointers: pagenumbers of the freelist leaf pages
+        s.freelistleafpointers = _unpack_from(fmt, s._data, fpstart)
+
+        # unallocated area is between pointers and reserved area
+        s.unallocated_offset = 8 + s.leafpointercount * lpsize
+        s.unallocated_size = s.usablepagesize - s.unallocated_offset
+
+        # initialize superclass
+        super().__init__()
+
+
+class FreeListLeafPage(Page):
+    ''' Class representing a Freelist Leaf Page '''
+
+    def __init__(s, data, offset, pagenum, pagesize, pagesource, usablepagesize):
+        ''' initialize a FreeListLeafPage from given data at given offset
+
+        Arguments:
+        - data           : data containing the page at given offset
+        - offset         : offset of the page structure
+        - pagenum        : the pagenumber (derived from offset or wal frame)
+        - pagesize       : the size of the page (derived from database header)
+        - pagesource     : PageSource value (DatabaseFile or WalFile)
+        - usablepagesize : usable page size as calculated from database header
+        '''
+
+        s._data = data
+        s.offset = offset
+        s.size = pagesize
+        s.pagenum = pagenum
+        s.pagesource = pagesource
+        s.usablepagesize = usablepagesize
+        s.pagetype = PageType.FreelistLeaf
+
+        # treat the entire page as unallocated
+        s.unallocated_offset = 0
+        s.unallocated_size = s.usablepagesize
+
+        # Freelist Leaf Pages are unmodified, but unallocated,
+        # attempt to parse the page as a Btree Page
+        try:
+            s.detected_page = BtreePage(s._data, s.offset, s.pagenum, s.size,
+                                        s.pagesource, s.usablepagesize)
+        except:
+            raise
+            s.detected_page = None
+
+        # initialize superclass
+        super().__init__()
