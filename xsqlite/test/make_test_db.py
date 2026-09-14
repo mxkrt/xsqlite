@@ -95,6 +95,18 @@ def generate_testdb():
         con.commit()
         log.write(f'[commit]\n')
 
+        # generate a record with a large blob to force overflow
+        i = 15000
+        blb = random.randbytes(10000)
+        txt = randomstring(random.randint(0,100))
+        real = random.random() * random.randint(0,1000)
+        nmbr = random.randint(0,2**63)
+        cur.execute("INSERT INTO table_one VALUES(?,?,?,?,?,?,?)",(i, i*2, f"record_{i}", txt, nmbr, real, sqlite3.Binary(blb),))
+        log.write(f'INSERT:\ttable_one\t{i}\t{i*2}\trecord_{i}\t{txt}\t{nmbr}\t{real}\t{binascii.hexlify(blb)}\n')
+
+        con.commit()
+        log.write(f'[commit]\n')
+
         # perform a checkpoint and reset the WAL
         cur.execute("PRAGMA wal_checkpoint(RESTART)")
         log.write("[PRAGMA wal_checkpoint(RESTART)]\n")
@@ -108,8 +120,8 @@ def generate_testdb():
         con.commit()
         log.write(f'[commit]\n')
 
-        # delete 100 consequetive records in an attempt to create freelist pages
-        for id_ in range(7720,7820):
+        # delete 400 consequetive records in an attempt to create freelist pages
+        for id_ in range(7720,8120):
             cur.execute(f"DELETE FROM table_one WHERE id = {id_}")
             log.write(f'DELETE:\ttable_one\trecord_{id_}\n')
 
