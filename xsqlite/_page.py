@@ -11,6 +11,11 @@ from struct import unpack_from as _unpack_from
 from ._varint import varint, varints
 
 
+################
+# Generic Page #
+################
+
+
 class PageSource(_Enum):
     ''' Enum for setting the source of a page (i.e. WAL or main db) '''
 
@@ -32,75 +37,14 @@ class PageType(_Enum):
     LockByte = 50
 
 
-# namedtuple representing a parsed Table B-Tree Interior Cell
-# - left_child_pointer: left child pointer (pagenumber)
-# - key: integer key
-# - cell_offset: relative offset of the cell within the page
-# - cell_size: size of the cell
-_table_interior_cell = _nt('table_interior_cell',
-                           'left_child_pointer key cell_offset cell_size')
-
-
-# namedtuple representing a parsed Table B-Tree Leaf Cell
-# - payloadsize: total payload size, including overflow (if any)
-# - rowid: rowid of record stored in the cell
-# - first_overflow_page: page number of first overflow page
-# - cell_offset: relative offset of the cell within the page (passed as arg)
-# - inline_payload_offset: relative offset of the inline payload within the page
-# - cell_size: total size of the cell (payload_size + headersize)
-# - inline_payload: the data stored as inline payload
-_table_leaf_cell = _nt('table_leaf_cell',
-                       'payloadsize rowid first_overflow_page '
-                       'cell_offset inline_payload_offset cell_size '
-                       'inline_payload')
-
-
-# namedtuple representing a parsed Index B-Tree Interior Cell
-# - left_child_pointer: left child pointer (pagenumber)
-# - payloadsize: total payload size, including overflow (if any)
-# - first_overflow_page: page number of first overflow page
-# - cell_offset: relative offset of the cell within the page
-# - inline_payload_offset: relative offset of the inline payload within the page
-# - cell_size: total size of the cell (payload_size + headersize)
-# - inline_payload: the data stored as inline payload
-_index_interior_cell = _nt('index_interior_cell',
-                           'left_child_pointer payloadsize '
-                           'first_overflow_page cell_offset '
-                           'inline_payload_offset cell_size '
-                           'inline_payload')
-
-
-# namedtuple representing a parsed Index B-Tree Leaf Cell
-# - payloadsize: total payload size, including overflow (if any)
-# - first_overflow_page: page number of first overflow page
-# - cell_offset: relative offset of the cell within the page
-# - inline_payload_offset: relative offset of the inline payload within the page
-# - cell_size: total size of the cell (payload_size + headersize)
-# - inline_payload: the data stored as inline payload
-_index_leaf_cell = _nt('index_leaf_cell',
-                       'payloadsize first_overflow_page '
-                       'cell_offset inline_payload_offset cell_size '
-                       'inline_payload')
-
-
-# namedtuple representing a parsed Freeblocks
-# - offset         : relative offset of this freeblock within page
-# - next_freeblock : relative offset of next freeblock within page
-# - size           : size of the current freeblock
-# - data_offset    : offset of data in page freeblock (offset+4)
-# - get_bytes      : bytes stored in the freeblock (incl. header)
-_freeblock = _nt('freeblock', 'offset next_freeblock size data_offset get_bytes')
-
-
 class Page():
     ''' Base class for database pages '''
-
 
     def __init__(s):
         ''' initialize Page object '''
 
         # check if the required fields are set
-        if not hasattr(s, "data"):
+        if not hasattr(s, "_data"):
             raise ValueError("Page: data not initialized")
         if not hasattr(s, "pagenum"):
             raise ValueError("Page: pagenumber not initialized")
@@ -110,12 +54,67 @@ class Page():
             raise ValueError("Page: size not initialized")
         if not hasattr(s, "pagesource"):
             raise ValueError("Page: pagesource not initialized")
+        if not hasattr(s, "unallocated_offset"):
+            raise ValueError("Page: unallocated_offset not initialized")
+        if not hasattr(s, "unallocated_size"):
+            raise ValueError("Page: unallocated_size not initialized")
 
 
     def get_bytes(s):
-        ''' return byte array with all page data '''
+        ''' return all page bytes '''
 
-        return s.data[s.offset:s.offset+s.size]
+        return s._data[s.offset:s.offset+s.size]
+
+
+    def get_unallocated(s):
+        ''' return bytes in the unallocated area '''
+
+        start = s.offset + s.unallocated_offset
+        end = start + s.unallocated_size
+        return s._data[start:end]
+
+
+    def get_reserved(s):
+        ''' return byte array with the reserved area '''
+
+        if s.reserved_size is None:
+            return
+
+        start = s.offset + s.reserved_offset
+        end = start + s.reserved_size
+        return s._data[start:end]
+
+
+##############
+# Btree Page #
+##############
+
+# namedtuple representing a parsed Table B-Tree Interior Cell
+_table_interior_cell_t = _nt('table_interior_cell',
+                             'left_child_pointer key cell_offset cell_size')
+
+# namedtuple representing a parsed Table B-Tree Leaf Cell
+_table_leaf_cell_t = _nt('table_leaf_cell',
+                         'payloadsize rowid first_overflow_page '
+                         'cell_offset inline_payload_offset cell_size '
+                         'inline_payload')
+
+# namedtuple representing a parsed Index B-Tree Interior Cell
+_index_interior_cell_t = _nt('index_interior_cell',
+                             'left_child_pointer payloadsize '
+                             'first_overflow_page cell_offset '
+                             'inline_payload_offset cell_size '
+                             'inline_payload')
+
+# namedtuple representing a parsed Index B-Tree Leaf Cell
+_index_leaf_cell_t = _nt('index_leaf_cell',
+                         'payloadsize first_overflow_page '
+                         'cell_offset inline_payload_offset cell_size '
+                         'inline_payload')
+
+# namedtuple representing a parsed Freeblocks
+_freeblock_t = _nt('freeblock',
+                   'offset next_freeblock size data_offset data')
 
 
 class BtreePage(Page):
@@ -133,37 +132,41 @@ class BtreePage(Page):
         - usablepagesize : usable page size as calculated from database header
         '''
 
-        s.data = data
+        s._data = data
         s.offset = offset
         s.size = pagesize
         s.pagenum = pagenum
         s.pagesource = pagesource
         s.usablepagesize = usablepagesize
 
+        # relative offset of header (mostly 0, except for page 1)
         if pagenum == 1:
             s.header_offset = 100
         else:
             s.header_offset = 0
 
-        # parse the page header
+        # parse the page header, which sets the following properties of
+        # the BtreePage instance: s.pagetype, s.first_freeblock_offset,
+        # s.cell_count, s.cell_content_offset, s.fragmented_freebytes,
+        # s.rightmost_pointer, s.headersize
         s._parse_pageheader()
 
-        # the cellpointers are directly after the header
+        # the cellpointers start directly after the header
         s.cell_pointers_offset = s.header_offset + s.headersize
 
         # the size of the cell pointer area (a cell pointer is two bytes wide)
         s.cell_pointers_size = s.cell_count * 2
 
-        # TODO: 
-        # TODO: next step is to parse the freeblocks
-        # collect the freeblocks on this page
-        ##fblocks = []
-        ##fboffset = pgheader.first_freeblock_offset
-        ##while fboffset != 0:
-        ##    fblock = freeblock(data, offset, fboffset)
-        ##    fboffset = fblock.next_freeblock
-        ##    fblocks.append(fblock)
+        # unallocated runs from cellpointer area to cell contents
+        s.unallocated_offset = s.cell_pointers_offset + s.cell_pointers_size
+        s.unallocated_size = s.cell_content_offset - s.unallocated_offset
 
+        # reserved area runs from end of cell content area to end of page
+        s.reserved_offset = None
+        s.reserved_size = None
+        if pagesize > usablepagesize:
+            s.reserved_offset = usablepagesize
+            s.reserved_size = pagesize - usablepagesize
 
         # initialize superclass
         super().__init__()
@@ -183,9 +186,9 @@ class BtreePage(Page):
         elif s.pagetype == PageType.TableBtreeLeaf:
             s._cells = [s._parse_table_leaf_cell(cp) for cp in s.cell_pointers()]
             # add a mapping from rowid to cell_number for convenience
-            s._rowidmap = {c.rowid: idx for idx,c in enumerate(s.cells())}
-            s.max_rowid = max(s._rowidmap.keys())
-            s.min_rowid = min(s._rowidmap.keys())
+            s.rowidmap = {c.rowid: idx for idx,c in enumerate(s.cells())}
+            s.max_rowid = max(s.rowidmap.keys())
+            s.min_rowid = min(s.rowidmap.keys())
             return s._cells
 
         elif s.pagetype == PageType.IndexBtreeInterior:
@@ -203,11 +206,13 @@ class BtreePage(Page):
         if s.pagetype != PageType.TableBtreeLeaf:
             raise ValueError("only Table Btree Leaf pags have cells with rowids")
 
-        if not hasattr(s, "_rowidmap"):
+        if not hasattr(s, "rowidmap"):
             # initialize by parsing the cells
             s.cells()
 
-        return s._rowidmap[rowid]
+        if not rowid in s.rowidmap:
+            raise ValueError(f"No allocated record with ROWID {rowid} on this page")
+        return s._cells[s.rowidmap[rowid]]
 
 
     def _parse_pageheader(s):
@@ -219,7 +224,7 @@ class BtreePage(Page):
         # parse first 8 bytes
         hsize = 8
         fmt = '>BHHHB'
-        parsed = _unpack_from(fmt, s.data, offset)
+        parsed = _unpack_from(fmt, s._data, offset)
 
         # determine the pagetype
         pgtype = parsed[0]
@@ -240,7 +245,6 @@ class BtreePage(Page):
         # cellcount: number of cells on this page.
         s.cell_count = parsed[2]
 
-
         # cell_content_offset: relative offset of cell content area.
         cellarea = parsed[3]
         # in some fields (including this one), value 0 means 65536
@@ -256,7 +260,7 @@ class BtreePage(Page):
         s.rightmost_pointer = None
         if pgtype in {2,5}:
             rmp_offset = offset + hsize
-            s.rightmost_pointer = _unpack_from('>I', s.data, rmp_offset)[0]
+            s.rightmost_pointer = _unpack_from('>I', s._data, rmp_offset)[0]
             hsize += 4
 
         # size of the header
@@ -280,7 +284,7 @@ class BtreePage(Page):
         offset = s.offset + s.cell_pointers_offset
 
         fmt = '>' + 'H' * s.cell_count
-        cpointers = _unpack_from(fmt, s.data, offset)
+        cpointers = _unpack_from(fmt, s._data, offset)
         # cellpointer value 0 means 65536
         s._cell_pointers = [65536 if p == 0 else p for p in cpointers]
         return s._cell_pointers
@@ -348,29 +352,46 @@ class BtreePage(Page):
 
     def _parse_table_interior_cell(s, cell_offset):
         ''' Parse bytes at given offset in page as Table B-Tree Interior Cell
+
+        Returns:
+        - Namedtuple representing a parsed Table B-Tree Interior Cell:
+          - left_child_pointer: left child pointer (pagenumber)
+          - key: integer key
+          - cell_offset: relative offset of the cell within the page
+          - cell_size: size of the cell
         '''
 
         # offset is relative to page offset
         offset = s.offset + cell_offset
 
         # read left child pointer
-        lcp = _unpack_from('>I', s.data, offset)[0]
+        lcp = _unpack_from('>I', s._data, offset)[0]
         # read the varint key
-        key, key_width = varint(s.data, offset + 4)
+        key, key_width = varint(s._data, offset + 4)
         cellsize = 4 + key_width
-        return _table_interior_cell(lcp, key, cell_offset, cellsize)
+        return _table_interior_cell_t(lcp, key, cell_offset, cellsize)
 
 
     def _parse_table_leaf_cell(s, cell_offset):
         ''' Parse bytes at given offset as Table B-Tree Leaf Cell
+
+        Returns:
+        - namedtuple representing aparsed Table B-Tree Leaf Cell:
+          - payloadsize: total payload size, including overflow (if any)
+          - rowid: rowid of record stored in the cell
+          - first_overflow_page: page number of first overflow page
+          - cell_offset: relative offset of the cell within the page (passed as arg)
+          - inline_payload_offset: relative offset of the inline payload within the page
+          - cell_size: total size of the cell (payload_size + headersize)
+          - inline_payload: the data stored as inline payload
         '''
 
         # offset is relative to page offset
         offset = s.offset + cell_offset
 
         # table B-Tree leaf cell starts with payloadsize and rowid
-        payloadsize, payloadsize_width = varint(s.data, offset)
-        rowid, rowid_width = varint(s.data, offset + payloadsize_width)
+        payloadsize, payloadsize_width = varint(s._data, offset)
+        rowid, rowid_width = varint(s._data, offset + payloadsize_width)
 
         # determine dimensions and location of inline payload
         ipsize = s._inline_payload_size(payloadsize)
@@ -378,7 +399,7 @@ class BtreePage(Page):
         # create slice for inline payload
         ipstart = payloadstart + offset
         ipend = ipstart + ipsize
-        payload = s.data[ipstart:ipend]
+        payload = s._data[ipstart:ipend]
         # make ipstart relative before returning
         ipstart = ipstart - s.offset
 
@@ -389,25 +410,35 @@ class BtreePage(Page):
         fop = None
         if payloadsize > ipsize:
             # read 4 byte integer for first overflow page (fop)
-            fop = _unpack_from('>I', s.data, offset + cellsize)[0]
+            fop = _unpack_from('>I', s._data, offset + cellsize)[0]
             cellsize += 4
 
-        return _table_leaf_cell(payloadsize, rowid, fop, cell_offset, ipstart,
-                                cellsize, payload)
+        return _table_leaf_cell_t(payloadsize, rowid, fop, cell_offset,
+                                  ipstart, cellsize, payload)
 
 
     def _parse_index_interior_cell(s, cell_offset):
         ''' Parse bytes at given offset as Index B-Tree Interior Cell
+
+        Returns:
+        - Namedtuple representing aparsed Table B-Tree Leaf Cell:
+          - left_child_pointer: left child pointer (pagenumber)
+          - payloadsize: total payload size, including overflow (if any)
+          - first_overflow_page: page number of first overflow page
+          - cell_offset: relative offset of the cell within the page
+          - inline_payload_offset: relative offset of the inline payload within the page
+          - cell_size: total size of the cell (payload_size + headersize)
+          - inline_payload: the data stored as inline payload
         '''
 
         # offset is relative to page offset
         offset = s.offset + cell_offset
 
         # read left child pointer
-        lcp = _unpack_from('>I', s.data, offset)[0]
+        lcp = _unpack_from('>I', s._data, offset)[0]
 
         # index B-Tree interior cell has key payloadsize at offset 4
-        payloadsize, payloadsize_width = varint(s.data, offset + 4)
+        payloadsize, payloadsize_width = varint(s._data, offset + 4)
 
         # determine dimensions and location of inline payload
         ipsize = s._inline_payload_size(payloadsize)
@@ -416,7 +447,7 @@ class BtreePage(Page):
         # create slice for inline payload
         ipstart = payloadstart + offset
         ipend = ipstart + ipsize
-        payload = s.data[ipstart:ipend]
+        payload = s._data[ipstart:ipend]
         # make ipstart relative before returning
         ipstart = ipstart - s.offset
 
@@ -427,22 +458,31 @@ class BtreePage(Page):
         fop = None
         if payloadsize > ipsize:
             # read 4 byte integer for first overflow page (fop)
-            fop = _unpack_from('>I', s.data, offset + cellsize)[0]
+            fop = _unpack_from('>I', s._data, offset + cellsize)[0]
             cellsize += 4
 
-        return _index_interior_cell(lcp, payloadsize, fop, cell_offset, ipstart,
-                                    cellsize, payload)
+        return _index_interior_cell_t(lcp, payloadsize, fop, cell_offset,
+                                      ipstart, cellsize, payload)
 
 
     def _parse_index_leaf_cell(s, cell_offset):
         ''' Parse bytes at given offset as Index B-Tree Leaf Cell
+
+        Returns:
+        - Namedtuple representing a parsed Index B-Tree Leaf Cell
+          - payloadsize: total payload size, including overflow (if any)
+          - first_overflow_page: page number of first overflow page
+          - cell_offset: relative offset of the cell within the page
+          - inline_payload_offset: relative offset of the inline payload within the page
+          - cell_size: total size of the cell (payload_size + headersize)
+          - inline_payload: the data stored as inline payload
         '''
 
         # offset is relative to page offset
         offset = s.offset + cell_offset
 
         # index B-Tree leaf cell starts with payloadsize
-        payloadsize, payloadsize_width = varint(s.data, offset)
+        payloadsize, payloadsize_width = varint(s._data, offset)
 
         # determine dimensions and location of inline payload
         ipsize = s._inline_payload_size(payloadsize)
@@ -451,7 +491,7 @@ class BtreePage(Page):
         # create slice for inline payload
         ipstart = payloadstart + offset
         ipend = ipstart + ipsize
-        payload = s.data[ipstart:ipend]
+        payload = s._data[ipstart:ipend]
         # make ipstart relative before returning
         ipstart = ipstart - s.offset
 
@@ -462,71 +502,47 @@ class BtreePage(Page):
         fop = None
         if payloadsize > ipsize:
             # read 4 byte integer for first overflow page (fop)
-            fop = _unpack_from('>I', s.data, offset + cellsize)[0]
+            fop = _unpack_from('>I', s._data, offset + cellsize)[0]
             cellsize += 4
 
-        return _index_leaf_cell(payloadsize, fop, cell_offset, ipstart,
-                                cellsize, payload)
+        return _index_leaf_cell_t(payloadsize, fop, cell_offset, ipstart,
+                                  cellsize, payload)
 
 
     def _parse_freeblock(s, fb_offset):
-        ''' Parse data at given offset as freeblock ''' 
+        ''' Parse data at given offset as freeblock
+
+        Returns:
+        - Namedtuple representing a parsed freeblock:
+          - offset         : relative offset of this freeblock within page
+          - next_freeblock : relative offset of next freeblock within page
+          - size           : size of the current freeblock
+          - data_offset    : offset of data in page freeblock (offset+4)
+          - data           : bytes stored in the freeblock (excl. header)
+        '''
 
         # offset is relative to page offset
         offset = s.offset + fb_offset
 
-        # read next freeblock pointer and freeblocksize
-        next_fb, size = _unpack_from('>HH', s.data, offset)
-        
-        def get_bytes():
-            ''' returns the data for this freeblock as bytes, excluding header '''
-            return s.data[offset:offset+size]
+        # read next freeblock pointer and freeblocksize (incl. header)
+        next_fb, size = _unpack_from('>HH', s._data, offset)
 
-        return _freeblock(fb_offset, next_fb, size, fb_offset+4, get_bytes)
+        fb_data = s._data[offset+4:offset+size]
+
+        return _freeblock_t(fb_offset, next_fb, size, fb_offset+4, fb_data)
 
 
-# btree page fields:
-# - header_offset: relative offset of header (mostly 0, except for page 1)
-# - header: the btree_pageheader for the current page
-# - cellpointer_offset : relative offset of the cellpointer area within the page
-# - cellpointer_area: the parsed cellpointer_area for the current page
-# - cells: a list of parsed cells
-# - rowidmap: {rowid:cellnumber} for table_leaf pages, None otherwise
-# - freeblocks: a list of freeblocks for this page
-# - unallocated_offset: relative offset of the unallocated space
-# - reserved_offset: relative offset of the reserved area (usablepagesize)
-# - size: the page size (passed in as variable)
-# - unallocated: the data stored in the unallocated area for this page
-# - reserved: the data stored in the reserved area for this page or None
-_btreepage = _nt('btree_page', 'pagetype header_offset header '
-                               'cellpointer_offset cellpointer_area '
-                               'cells rowidmap freeblocks '
-                               'unallocated_offset reserved_offset size '
-                               'unallocated reserved')
+    def freeblocks(s):
+        ''' Parse the freeblocks on this BtreePage '''
 
+        if hasattr(s, '_freeblocks'):
+            return s._freeblocks
 
-def btree_page(data, offset, pagesize, usablepagesize, isheaderpage=False):
-
-    # relative offset of unallocated space
-    # (from end of last cellpointer to cell content area)
-    cpa_offset = hoffset + pgheader.size - offset
-    cpa_size = pgheader.cellcount * 2
-    # size of unallocated area
-    usize = pgheader.cell_content_offset - (cpa_offset + cpa_size)
-    # relative offset of unallocated area
-    uoffset = cpa_offset + cpa_size
-    # NOTE: uoffset is relative, so need to add offset
-    unalloc = data[uoffset+offset:uoffset+usize+offset]
-
-    # reserved area runs from end of cell content area to end of page
-    res = None
-    res_offset = None
-    if pagesize > usablepagesize:
-        res_offset = offset+usablepagesize
-        res = data[res_offset:offset+pagesize]
-        # make the offsets relative to page offset before returning
-        res_offset = res_offset - offset
-
-    return _btreepage(pgheader.pagetype, hoffset-offset, pgheader, cpa_offset,
-                      cpa, cells, rowidmap, fblocks, uoffset, res_offset, pagesize,
-                      unalloc, res)
+        # collect the freeblocks on this page
+        s._freeblocks = []
+        fb_offset = s.first_freeblock_offset
+        while fb_offset != 0:
+            fblock = s._parse_freeblock(fb_offset)
+            fb_offset = fblock.next_freeblock
+            s._freeblocks.append(fblock)
+        return s._freeblocks
