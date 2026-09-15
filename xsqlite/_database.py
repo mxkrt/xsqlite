@@ -23,7 +23,8 @@ from . import _structures
 from . import _sql
 from . import _decode
 from ._wal import WalFile
-from ._page import Page, PageSource
+from ._page import PageSource, PageType, Page, BtreePage
+from ._page import FreeListLeafPage, FreeListTrunkPage
 from ._sqlitemaster import SQLiteMaster
 
 
@@ -32,7 +33,8 @@ class Database():
 
 
     def __init__(s, infile, wal=None, journal=None):
-        ''' open the given file as Database object, optionally including wal or journal file
+
+        ''' Load given file as Database object, optionally with wal or journal file
 
         infile, wal and journal can be filepath (string) or an already opened file-like objects
 
@@ -41,76 +43,30 @@ class Database():
         '''
 
         if wal is not None and journal is not None:
-            raise _exceptions.InvalidArgumentException("only one of wal or journal can be given")
+            raise ValueError("Only one of 'wal' or 'journal' can be given")
 
-        if isinstance(infile, str):
-            # parse the file as constant bitstream
-            s.filename = _path.abspath(_path.expanduser(infile))
-            dbfile = open(s.filename, 'rb')
-            s.data = _mmap.mmap(dbfile.fileno(), 0, access=_mmap.ACCESS_READ)
-        elif isinstance(infile, _mmap.mmap):
-            # we already have an mmapped file
-            s.filename = None
-            s.data = infile
-        elif hasattr(infile, 'read') and hasattr(infile, 'seek'):
-            # read the bytes from the file as constant bitstream
-            s.filename = None
-            s.data = _mmap.mmap(infile.fileno(), 0, access=_mmap.ACCESS_READ)
-        else:
-            raise ValueError("expected filename, mmapped file or file-like object")
-
-        if wal is not None:
-            s.walfile = WalFile(wal)
-        else:
-            # check if a WAL file exists in the same directory as the main db file
-            if s.filename is not None:
-                if _path.exists(s.filename+'-wal'):
-                    s.walfile = WalFile(s.filename+'-wal')
-
-        if journal is not None:
-            if isinstance(journal, str):
-                # open and mmap the file (parsing not yet supported)
-                s.journalfilename = _path.abspath(_path.expanduser(journal))
-                if _stat(s.journalfilename).st_size != 0:
-                    jfile = open(s.journalfilename, 'rb')
-                    s.journaldata = _mmap.mmap(jfile.fileno(), 0, access=_mmap.ACCESS_READ)
-            elif isinstance(journal, _mmap.mmap):
-                # we already have an mmapped file
-                s.journaldata = journal
-            elif hasattr(journal, 'read') and hasattr(journal, 'seek'):
-                s.journaldata = _mmap.mmap(jfile.fileno(), 0, access=_mmap.ACCESS_READ)
-            else:
-                raise ValueError("expected filename, mmapped file or file-like object")
-
-        else:
-            # check if a journal file exists in the same directory as the main db file
-            if s.filename is not None:
-                dirname = _path.dirname(s.filename)
-                basename = _path.basename(s.filename)
-                journalpath = _path.join(dirname, basename+'-journal')
-                if _path.exists(journalpath):
-                    s.journalfilename = journalpath
-                    if _stat(s.journalfilename).st_size != 0:
-                        jfile = open(s.journalfilename, 'rb')
-                        s.journaldata = _mmap.mmap(jfile.fileno(), 0, access=_mmap.ACCESS_READ)
-
-        if hasattr(s, 'walfile') and hasattr(s, 'journaldata'):
-            raise ValueError('database appears to have a WAL and a journal file!')
+        # load and mmap the database file(s)
+        s._load_files(infile, wal, journal)
 
         # parse the header at offset 0
         s.header = _structures.dbheader(s.data, offset=0)
 
         if hasattr(s, 'walfile'):
             if s.header.pagesize != s.walfile.header.pagesize:
-                raise _exceptions.AssumptionBrokenException("wal and main db disagree on pagesize")
+                raise ValueError("WAL and database header disagree on pagesize")
 
         # check if the header indicates wal mode or not
         if s.header.writeversion == 2 and s.header.readversion == 2:
             s.walmode = True
         elif s.header.writeversion != s.header.readversion:
-            raise _exceptions.AssumptionBrokenException("writeversion and readversion differ")
+            raise ValueError("writeversion and readversion expected equal")
         else:
             s.walmode = False
+
+        # TODO: everything below here should be checked for passing the 
+        #       correct data if it is a page from WAL
+
+        return
 
         # check if total freelistpages match header
         total_freelist_pages = len(list(s.freelist_pages()))
@@ -122,6 +78,9 @@ class Database():
                 pass
             else:
                 raise ValueError('total nr of freelistpages incorrect')
+
+        return
+
 
         # parse sqlite_master table (stored in btree starting in page 1)
         s.sqlite_master = SQLiteMaster(s.rowidrecords(1), s.header.textencoding)
@@ -136,12 +95,88 @@ class Database():
         s.tablenames = [n for n in s.tables.keys()]
 
 
+    def _load_files(s, infile, wal, journal):
+        ''' open and mmap the given database file(s) '''
+
+        # main db file
+        if isinstance(infile, str):
+            s.filename = _path.abspath(_path.expanduser(infile))
+            dbfile = open(s.filename, 'rb')
+            s.data = _mmap.mmap(dbfile.fileno(), 0, access=_mmap.ACCESS_READ)
+        elif isinstance(infile, _mmap.mmap):
+            # we already have an mmapped file
+            s.filename = None
+            s.data = infile
+        elif hasattr(infile, 'read') and hasattr(infile, 'seek'):
+            # read the bytes from the file as constant bitstream
+            s.filename = None
+            s.data = _mmap.mmap(infile.fileno(), 0, access=_mmap.ACCESS_READ)
+        else:
+            raise ValueError("expected filename, mmapped file or file-like object")
+
+        # WAL file
+        if wal is not None:
+            s.walfile = WalFile(wal)
+            return
+        elif s.filename is not None:
+            # check if a WAL file exists in the same directory as the main db file
+            if _path.exists(s.filename+'-wal'):
+                s.walfile = WalFile(s.filename+'-wal')
+                return
+
+        # journal file
+        if isinstance(journal, str):
+            # open and mmap the file (parsing not yet supported)
+            s.journalfilename = _path.abspath(_path.expanduser(journal))
+            if _stat(s.journalfilename).st_size != 0:
+                jfile = open(s.journalfilename, 'rb')
+                s.journaldata = _mmap.mmap(jfile.fileno(), 0, access=_mmap.ACCESS_READ)
+        elif isinstance(journal, _mmap.mmap):
+            # we already have an mmapped file
+            s.journaldata = journal
+        elif hasattr(journal, 'read') and hasattr(journal, 'seek'):
+            s.journaldata = _mmap.mmap(jfile.fileno(), 0, access=_mmap.ACCESS_READ)
+        elif journal is not None:
+            raise ValueError("expected filename, mmapped file or file-like object")
+        else:
+            # check if a journal file exists in the same directory as the main db file
+            if s.filename is not None:
+                dirname = _path.dirname(s.filename)
+                basename = _path.basename(s.filename)
+                journalpath = _path.join(dirname, basename+'-journal')
+                if _path.exists(journalpath):
+                    s.journalfilename = journalpath
+                    if _stat(s.journalfilename).st_size != 0:
+                        jfile = open(s.journalfilename, 'rb')
+                        s.journaldata = _mmap.mmap(jfile.fileno(), 0, access=_mmap.ACCESS_READ)
+
+
+
+    ########
+    # TODO #
+    ########
+
+    # check all below this line
+
+    def page_is_in_wal(s, pagenumber):
+        ''' return True if page is in WAL file, False otherwise '''
+
+        if hasattr(s, 'walfile'):
+            walframe = s.walfile.get_page_frame(pagenumber)
+            if walframe is not None:
+                return True
+        return False
+
+
+
     def get_pageoffset(s, pagenumber):
         ''' function that returns the offset of the page with given pagenumber
         '''
 
+        raise RuntimeError("Work in progress")
+
         if pagenumber < 1:
-            raise _exceptions.InvalidArgumentException('pagenumbers start at 1 in SQLite fileformat')
+            raise ValueError('pagenumbers start at 1 in SQLite fileformat')
 
         # if the page is an active page in the WAL file, return the WAL frame contents offset
         if s.page_is_in_wal(pagenumber):
@@ -171,15 +206,6 @@ class Database():
         return s.data[start:end]
 
 
-    def page_is_in_wal(s, pagenumber):
-        ''' return True if page is in WAL file, False otherwise '''
-
-        if hasattr(s, 'walfile'):
-            walframe = s.walfile.get_page_frame(pagenumber)
-            if walframe is not None:
-                return True
-        return False
-
 
     def get_btreepage(s, pagenumber):
         ''' Parse given page as btree page and return a parsed page
@@ -187,6 +213,10 @@ class Database():
         A page object is a simple object combining a pagenumber, pageoffset and a
         parsed page. This function is a wrapper for _structures.btree_page.
         '''
+
+        # TODO: this is incorrect, we need to pass in either s.data or walfile
+        # data, depending on page source
+        raise ValueError("work in progress")
 
         pg_offset = s.get_pageoffset(pagenumber)
         # TODO: instead of slicing, pass the correct mmapped data (main or wal)
@@ -197,10 +227,17 @@ class Database():
         if pagenumber == 1:
             isheaderpage = True
 
+        if s.page_is_in_wal(pagenumber):
+            pg_source = PageSource.WalFile
+        else:
+            pg_source = PageSource.DatabaseFile
+
+        page = BtreePage(s.data, pg_offset, pagenumber, s.header.pagesize,
+                         pg_source, s.header.usablepagesize)
+        return page
         # use offset 0 here, since data contains only the single page to be parsed
-        page = _structures.btree_page(pg_data, 0, s.header.pagesize, s.header.usablepagesize, isheaderpage)
-        from_wal = s.page_is_in_wal(pagenumber)
-        return Page(pg_data, page, pagenumber, pg_offset, from_wal)
+        #page = _structures.btree_page(pg_data, 0, s.header.pagesize, s.header.usablepagesize, isheaderpage)
+        #return Page(pg_data, page, pagenumber, pg_offset, from_wal)
 
 
     def get_page_by_rowid(s, rootpagenumber, rowid):
@@ -240,7 +277,7 @@ class Database():
 
 
     def treewalker(s, rootpagenumber):
-        ''' Generates a sequence of btree pages for a given btree-page object. The
+        ''' Generates a sequence of btree pages starting at given pagenumber. The
         generated sequence represents the subtree under the given page. Both
         the interior and the leaf table pages are returned so that this can be used
         for both index and table trees (index pages contain data, especially for
@@ -257,23 +294,19 @@ class Database():
         '''
 
         # start with the rootpage
-        btpage = s.get_btreepage(rootpagenumber)
+        rootpage = s.get_btreepage(rootpagenumber)
+        yield rootpage
 
-        yield btpage
-
-        if btpage.page.pagetype in ['table_leaf', 'index_leaf']:
-            # leaf pages have no subtree
-            pass
-
-        elif btpage.page.pagetype in ['table_interior', 'index_interior']:
-            # interior pages have subtrees, descent into them
-            for cell in btpage.page.cells:
+        # visit the children of interior pages
+        if rootpage.pagetype == PageType.TableBtreeInterior or \
+                rootpage.pagetype == PageType.IndexBtreeInterior:
+            # first the left pointers
+            for cell in rootpage.cells:
                 subpagenum = cell.left_child_pointer
                 for subpage in s.treewalker(subpagenum):
                     yield subpage
-
-            # don't forget the rightmost pointer
-            rmp = btpage.page.header.rightmost_pointer
+            # and finally the rightmost pointer
+            rmp = rootpage.rightmost_pointer
             for subpage in s.treewalker(rmp):
                 yield subpage
 
@@ -316,37 +349,46 @@ class Database():
         return None
 
 
-    def _freelist_pages(s, freelist_trunkpage_number):
-        ''' yields all freelist pages starting at the given trunkpage '''
-
-        # when the next freelist trunkpage number is 0, we are done
-        if freelist_trunkpage_number == 0:
-            return
-
-        # parse and yield the freelist trunkpage
-        pg_data = s.get_page_data(freelist_trunkpage_number)
-        pageoffset = s.get_pageoffset(freelist_trunkpage_number)
-        rootfltpage = _structures.freelisttrunkpage(pg_data, 0, s.header.pagesize, s.header.usablepagesize)
-        from_wal = s.page_is_in_wal(freelist_trunkpage_number)
-        yield Page(pg_data, rootfltpage, freelist_trunkpage_number, pageoffset, from_wal)
-
-        # yield all pages pointed to by the leaf pointers in the trunkpage
-        for pgnum in rootfltpage.freelistleafpointers:
-            pg_data = s.get_page_data(pgnum)
-            pg_offset = s.get_pageoffset(pgnum)
-            leafpage = _structures.freelistleafpage(pg_data, 0, s.header.pagesize, s.header.usablepagesize)
-            from_wal = s.page_is_in_wal(pgnum)
-            yield Page(pg_data, leafpage, pgnum, pg_offset, from_wal)
-
-        # continue with the next freelist trunk page
-        for pg in s._freelist_pages(rootfltpage.nextfreelisttrunkpage):
-            yield pg
-
-
     def freelist_pages(s):
-        ''' Generates a sequence of all freelist pages within the SQLite file. '''
+        ''' Generates a sequence of all freelist pages in the database. '''
 
-        for pg in s._freelist_pages(s.header.firstfreelisttrunkpage):
+        def _fpages(pnum):
+            ''' yields all freelist pages starting at the given trunkpage '''
+
+            # when the next freelist trunkpage number is 0, we are done
+            if pnum == 0:
+                return
+
+            # get the page offset
+            pageoffset = s.get_pageoffset(pnum)
+
+            if s.page_is_in_wal(pnum):
+                pagesource = PageSource.WALFile
+            else:
+                pagesource = PageSource.DatabaseFile
+
+            # parse and yield the freelist trunkpage
+            tpage = FreeListTrunkPage(s.data, pageoffset, pnum, s.header.pagesize,
+                                      pagesource, s.header.usablepagesize)
+            yield tpage
+
+            # yield all pages pointed to by the leaf pointers in the trunkpage
+            for pnum in tpage.freelistleafpointers:
+                pageoffset = s.get_pageoffset(pnum)
+                if s.page_is_in_wal(pnum):
+                    pagesource = PageSource.WALFile
+                else:
+                    pagesource = PageSource.DatabaseFile
+                lpage = FreeListLeafPage(s.data, pageoffset, pnum,
+                                         s.header.pagesize, pagesource,
+                                         s.header.usablepagesize)
+                yield lpage
+
+            # process the next FreeList Trunk Page
+            for pg in _fpages(tpage.nextfreelisttrunkpage):
+                yield pg
+
+        for pg in _fpages(s.header.firstfreelisttrunkpage):
             yield pg
 
 
@@ -395,25 +437,26 @@ class Database():
         # parse the rootpage to check pagetype
         rootpage = s.get_btreepage(rootpagenumber)
 
-        if rootpage.page.pagetype not in ['table_leaf', 'table_interior']:
-            raise ValueError('rowidrecords should be called on table b-tree page')
+        if rootpage.pagetype != PageType.TableBtreeLeaf:
+            if rootpage.pagetype != PageType.TableBtreeInterior:
+                raise ValueError('Given page is not a Table Btree Page')
 
         # walk the tree
         tree = s.treewalker(rootpagenumber)
 
         # for table B-tree pages, records are only stored in the table leaf pages
         for page in tree:
-            if page.page.pagetype == 'table_leaf':
+            if page.pagetype == PageType.TableBtreeLeaf:
                 # yield records on this page in rowid order, not in
                 # cell-location order
-                rowids_on_page = [r for r in page.page.rowidmap.keys()]
+                rowids_on_page = [r for r in page.rowidmap.keys()]
                 rowids_on_page.sort()
                 for rowid in rowids_on_page:
-                    cellnum = page.page.rowidmap[rowid]
-                    parsed_cell = page.page.cells[cellnum]
+                    cellnum = page.rowidmap[rowid]
+                    parsed_cell = page.cells[cellnum]
                     # make logical cell out of raw cell
                     pload = Payload(s, parsed_cell)
-                    cell = Cell(parsed_cell, pload, cellnum, page.pagenumber, page.pageoffset, page.pagesource)
+                    cell = Cell(parsed_cell, pload, cellnum, page.pagenum, page.pageoffset, page.pagesource)
                     yield RowidRecord(cell)
 
 
