@@ -68,6 +68,9 @@ def generate_testdb():
             nmbr = random.randint(0,2**63)
             cur.execute("INSERT INTO table_one VALUES(?,?,?,?,?,?,?)",(i, i*2, f"record_{i}", txt, nmbr, real, sqlite3.Binary(blb),))
             log.write(f'INSERT:\ttable_one\t{i}\t{i*2}\trecord_{i}\t{txt}\t{nmbr}\t{real}\t{binascii.hexlify(blb)}\n')
+            if i%500 == 0:
+                con.commit()
+                log.write(f'[commit]\n')
 
         con.commit()
         log.write(f'[commit]\n')
@@ -91,6 +94,9 @@ def generate_testdb():
             nmbr = random.randint(0,2**63)
             cur.execute("INSERT INTO table_one VALUES(?,?,?,?,?,?,?)",(i, i*2, f"record_{i}", txt, nmbr, real, sqlite3.Binary(blb),))
             log.write(f'INSERT:\ttable_one\t{i}\t{i*2}\trecord_{i}\t{txt}\t{nmbr}\t{real}\t{binascii.hexlify(blb)}\n')
+            if i%500 == 0:
+                con.commit()
+                log.write(f'[commit]\n')
 
         con.commit()
         log.write(f'[commit]\n')
@@ -116,6 +122,9 @@ def generate_testdb():
             id_ = random.randint(300,15000)
             cur.execute(f"DELETE FROM table_one WHERE id = {id_}")
             log.write(f'DELETE:\ttable_one\trecord_{id_}\n')
+            if i%50 == 0:
+                con.commit()
+                log.write(f'[commit]\n')
 
         con.commit()
         log.write(f'[commit]\n')
@@ -124,6 +133,9 @@ def generate_testdb():
         for id_ in range(7720,8120):
             cur.execute(f"DELETE FROM table_one WHERE id = {id_}")
             log.write(f'DELETE:\ttable_one\trecord_{id_}\n')
+            if id_%50 == 0:
+                con.commit()
+                log.write(f'[commit]\n')
 
         con.commit()
         log.write(f'[commit]\n')
