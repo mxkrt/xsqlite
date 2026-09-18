@@ -641,7 +641,7 @@ class FreeListLeafPage(Page):
             s.detected_page = BtreePage(s._data, s.offset, s.pagenum, s.size,
                                         s.pagesource, s.usablepagesize)
         except:
-            raise
+            raise ValueError("Work in progress, detect other page types?")
             s.detected_page = None
 
         # initialize superclass

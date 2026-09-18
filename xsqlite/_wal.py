@@ -13,7 +13,7 @@ from os import stat as _stat
 
 from . import _exceptions
 from . import _structures
-from ._page import Page, PageSource
+from ._page import Page, PageSource, BtreePage
 
 
 def walchecksum(integers, s0=0, s1=0):
@@ -49,11 +49,12 @@ class WalFile():
     frames within the WAL are valid and which are leftovers from prior
     checkpoints.  '''
 
-    def __init__(s, file):
+    def __init__(s, file, usablepagesize):
         ''' initialize a WAL file object from the given file
 
         Arguments:
-        - file : a filename, a file-like object or an mmapped file
+        - file           : filename, a file-like object or an mmapped file
+        - usablepagesize : usable page size as defined in main db header
 
         Returns:
         - WalFile : initialized WALFile object
@@ -77,6 +78,9 @@ class WalFile():
             s.data = _mmap.mmap(file.fileno(), 0, access=_mmap.ACCESS_READ)
         else:
             raise ValueError("expected filename, mmapped file or file-like object")
+
+        # store the usable page size so we can parse frames as Btree Pages
+        s.usablepagesize = usablepagesize
 
         # wal file size
         s.filesize = s.data.size()
@@ -518,19 +522,18 @@ class WalFile():
             yield s.get_frame(i)
 
 
-    def superseded_pages(s):
+    def superseded_pages(s, usablepagesize):
         ''' generate a sequence of pages from WAL file that have been superseded by a newer page
 
         All generated pages originate from the frames in the WAL file prior to the mxFrame '''
 
         # pages from the WAL file that have been superseded by a page from a later WAL frame
         for frame in s.superseded_frames():
-            # determine the offset of the page in the WAL file
-            pageoffset = frame.contents_offset
-            # unpack as a generic page
-            page = _structures.genericpage(frame.contents, 0, s.pagesize)
-            from_wal = True
-            yield Page(frame.contents, page, frame.pagenumber, pageoffset, from_wal)
+            try:
+                yield s.parse_page(frame, usablepagesize)
+            except:
+                raise
+                #raise ValueError("Work in progress, detect other page types")
 
 
     def outdated_pages(s):
@@ -541,12 +544,23 @@ class WalFile():
 
         # pages from the WAL file that have been superseded by a page from a later WAL frame
         for frame in s.outdated_frames():
-            # determine the offset of the page in the WAL file
-            pageoffset = frame.contents_offset
-            # unpack as a generic page
-            page = _structures.genericpage(frame.contents, 0, s.pagesize)
-            from_wal = True
-            yield Page(frame.contents, page, frame.pagenumber, pageoffset, from_wal)
+            try:
+                yield s.parse_page(frame, usablepagesize)
+            except:
+                raise
+
+
+    def parse_page(s, frame, usablepagesize):
+        ''' attempt to parse the frame as Btree Page '''
+
+        offset = frame.contents_offset
+        try:
+            return BtreePage(s.data, offset, frame.pagenumber, 
+                             s.pagesize, PageSource.WALFile,
+                             usablepagesize)
+        except:
+            raise
+            raise ValueError("Work in progress, detect other page types")
 
 
 class WalFrame():
@@ -577,7 +591,6 @@ class WalFrame():
         s.checksum2 = s.header.checksum2
 
 
-
     def walframeheader(s, data, offset=0):
         ''' Parses given data as WAL frame header
 
@@ -592,7 +605,6 @@ class WalFrame():
             - checksum2: Second half of the cumulative checksum
         '''
 
-
         _wal_frame_header = _nt('wal_frame_header', 'pagenumber commit_page_count salt1 salt2 '
                                                 'checksum1 checksum2')
         fmt = '>IIIIII'
@@ -606,7 +618,6 @@ class WalFrame():
         checksum2 = parsed[5]
 
         return _wal_frame_header(pagenumber, commit_page_count, salt1, salt2, checksum1, checksum2)
-
 
 
     def compute_checksum(s, endianness, init_checksum1=0, init_checksum2=0):
@@ -636,3 +647,6 @@ class WalFrame():
 
         c1,c2 = walchecksum(integers, init_checksum1, init_checksum2)
         return (c1, c2)
+
+
+

@@ -45,17 +45,14 @@ class Database():
         if wal is not None and journal is not None:
             raise ValueError("Only one of 'wal' or 'journal' can be given")
 
-        # load and mmap the database file(s)
-        s._load_files(infile, wal, journal)
+        # load and mmap the database file
+        s._load_db(infile)
 
         # parse the header at offset 0
         s.header = _structures.dbheader(s.data, offset=0)
 
-        if hasattr(s, 'walfile'):
-            if s.header.pagesize != s.walfile.header.pagesize:
-                raise ValueError("WAL and database header disagree on pagesize")
-
         # check if the header indicates wal mode or not
+        # (which does not mean that a WAL is always present)
         if s.header.writeversion == 2 and s.header.readversion == 2:
             s.walmode = True
         elif s.header.writeversion != s.header.readversion:
@@ -63,7 +60,19 @@ class Database():
         else:
             s.walmode = False
 
-        # TODO: everything below here should be checked for passing the 
+        # attempt to load walfile
+        s._load_wal(wal, s.header.usablepagesize)
+
+        if hasattr(s, 'walfile'):
+            if s.header.pagesize != s.walfile.header.pagesize:
+                raise ValueError("WAL and database header disagree on pagesize")
+        else:
+            # attempt to load journal
+            s._load_journal(journal)
+
+
+
+        # TODO: everything below here should be checked for passing the
         #       correct data if it is a page from WAL
 
         return
@@ -95,12 +104,11 @@ class Database():
         s.tablenames = [n for n in s.tables.keys()]
 
 
-    def _load_files(s, infile, wal, journal):
-        ''' open and mmap the given database file(s) '''
+    def _load_db(s, infile):
+        ''' open and mmap the given database file '''
 
-        # main db file
         if isinstance(infile, str):
-            s.filename = _path.abspath(_path.expanduser(infile))
+            s.filename = _path.realpath(_path.expanduser(infile))
             dbfile = open(s.filename, 'rb')
             s.data = _mmap.mmap(dbfile.fileno(), 0, access=_mmap.ACCESS_READ)
         elif isinstance(infile, _mmap.mmap):
@@ -114,20 +122,26 @@ class Database():
         else:
             raise ValueError("expected filename, mmapped file or file-like object")
 
-        # WAL file
+
+    def _load_wal(s, wal, usablepagesize):
+        ''' load and mmap the given wal file '''
+
         if wal is not None:
-            s.walfile = WalFile(wal)
+            s.walfile = WalFile(wal, usablepagesize)
             return
         elif s.filename is not None:
             # check if a WAL file exists in the same directory as the main db file
             if _path.exists(s.filename+'-wal'):
-                s.walfile = WalFile(s.filename+'-wal')
+                s.walfile = WalFile(s.filename+'-wal', usablepagesize)
                 return
 
-        # journal file
+
+    def _load_journal(s, journal):
+        ''' load and mmap the journal file '''
+
         if isinstance(journal, str):
             # open and mmap the file (parsing not yet supported)
-            s.journalfilename = _path.abspath(_path.expanduser(journal))
+            s.journalfilename = _path.realpath(_path.expanduser(journal))
             if _stat(s.journalfilename).st_size != 0:
                 jfile = open(s.journalfilename, 'rb')
                 s.journaldata = _mmap.mmap(jfile.fileno(), 0, access=_mmap.ACCESS_READ)
@@ -170,25 +184,23 @@ class Database():
 
 
     def get_pageoffset(s, pagenumber):
-        ''' function that returns the offset of the page with given pagenumber
-        '''
-
-        raise RuntimeError("Work in progress")
+        ''' Get the offset of given page in either main db or WAL file '''
 
         if pagenumber < 1:
             raise ValueError('pagenumbers start at 1 in SQLite fileformat')
 
-        # if the page is an active page in the WAL file, return the WAL frame contents offset
         if s.page_is_in_wal(pagenumber):
+            # return the offset of the page data in the WAL file
             walframe = s.walfile.get_page_frame(pagenumber)
             return walframe.contents_offset
 
+        # if we get here, check if the page is within bounds
         if s.header.inheadersizevalid and pagenumber > s.header.dbsize:
             raise _exceptions.InvalidArgumentException('pagenumber points beyond EOF')
-
         if not s.header.inheadersizevalid and pagenumber > s.header.externalsize:
             raise _exceptions.InvalidArgumentException('pagenumber points beyond EOF')
 
+        # return the offset in the main database
         return (pagenumber - 1) * s.header.pagesize
 
 
@@ -364,11 +376,13 @@ class Database():
 
             if s.page_is_in_wal(pnum):
                 pagesource = PageSource.WALFile
+                data_obj = s.walfile.data
             else:
                 pagesource = PageSource.DatabaseFile
+                data_obj = s.data
 
             # parse and yield the freelist trunkpage
-            tpage = FreeListTrunkPage(s.data, pageoffset, pnum, s.header.pagesize,
+            tpage = FreeListTrunkPage(data_obj, pageoffset, pnum, s.header.pagesize,
                                       pagesource, s.header.usablepagesize)
             yield tpage
 
