@@ -15,10 +15,9 @@ from functools import partial as _partial
 import os.path as _path
 from os import stat as _stat
 from enum import Enum as _Enum
-from struct import unpack as _unpack
+from struct import unpack_from as _unpack_from
 import mmap as _mmap
 
-from . import _exceptions
 from . import _structures
 from . import _sql
 from . import _decode
@@ -33,13 +32,15 @@ class Database():
 
 
     def __init__(s, infile, wal=None, journal=None):
+        ''' Load given file as Database object, with optional WAL or journal
 
-        ''' Load given file as Database object, optionally with wal or journal file
+        Arguments:
+        - infile  : path or file-like object for main database file
+        - wal     : optional path or file-like object for WAL file
+        - journal : optional path or file-like object for journal file
 
-        infile, wal and journal can be filepath (string) or an already opened file-like objects
-
-        If wal or journal are not given, we try to detect if a WAL or journal file exists
-        in the same directory as the main database file.
+        Only one of wal or journal may be given. If not given, we try to detect
+        the WAL or journal within the same directory as the main database file
         '''
 
         if wal is not None and journal is not None:
@@ -48,47 +49,38 @@ class Database():
         # load and mmap the database file
         s._load_db(infile)
 
-        # parse the header at offset 0
-        s.header = _structures.dbheader(s.data, offset=0)
+        # attempt to load walfile
+        s._load_wal(wal)
+
+        if not hasattr(s, 'walfile'):
+            # attempt to load journal
+            s._load_journal(journal)
+
+        # parse the database header from page 1
+        if s.is_page_visible_in_wal(1) is True:
+            hdr_frame = s.walfile.get_visible_page_frame(1)
+            s.header = s._parse_header(hdr_frame.contents[0:100])
+        else:
+            s.header = s._parse_header(s.data[0:100])
+
+        # calculated size of database in pages based on available data
+        s.externalsize = int(len(s.data) / s.header.pagesize)
 
         # check if the header indicates wal mode or not
-        # (which does not mean that a WAL is always present)
+        s.walmode = False
         if s.header.writeversion == 2 and s.header.readversion == 2:
             s.walmode = True
         elif s.header.writeversion != s.header.readversion:
             raise ValueError("writeversion and readversion expected equal")
-        else:
-            s.walmode = False
-
-        # attempt to load walfile
-        s._load_wal(wal, s.header.usablepagesize)
 
         if hasattr(s, 'walfile'):
             if s.header.pagesize != s.walfile.header.pagesize:
                 raise ValueError("WAL and database header disagree on pagesize")
-        else:
-            # attempt to load journal
-            s._load_journal(journal)
 
-
+        return
 
         # TODO: everything below here should be checked for passing the
-        #       correct data if it is a page from WAL
-
-        return
-
-        # check if total freelistpages match header
-        total_freelist_pages = len(list(s.freelist_pages()))
-        if s.header.totalfreelistpages != total_freelist_pages:
-            if hasattr(s, 'walfile'):
-                # in this case, it might be the case that the
-                # header has not yet been updated since there is
-                # still a checkpoint operation to be done.
-                pass
-            else:
-                raise ValueError('total nr of freelistpages incorrect')
-
-        return
+        #       correct data if it is a page from WA
 
 
         # parse sqlite_master table (stored in btree starting in page 1)
@@ -123,7 +115,7 @@ class Database():
             raise ValueError("expected filename, mmapped file or file-like object")
 
 
-    def _load_wal(s, wal, usablepagesize):
+    def _load_wal(s, wal):
         ''' load and mmap the given wal file '''
 
         if wal is not None:
@@ -132,7 +124,7 @@ class Database():
         elif s.filename is not None:
             # check if a WAL file exists in the same directory as the main db file
             if _path.exists(s.filename+'-wal'):
-                s.walfile = WalFile(s.filename+'-wal', usablepagesize)
+                s.walfile = WalFile(s.filename+'-wal')
                 return
 
 
@@ -165,111 +157,298 @@ class Database():
                         s.journaldata = _mmap.mmap(jfile.fileno(), 0, access=_mmap.ACCESS_READ)
 
 
+    def _parse_header(s, data):
+        ''' Parse the database header in given 100 bytes '''
 
-    ########
-    # TODO #
-    ########
+        # namedtuple representing the database header
+        _hdr_t = _nt('database_header',
+                     'headerstring pagesize writeversion '
+                     'readversion reservedspace maxpayloadfraction '
+                     'minpayloadfraction leafpayloadfraction '
+                     'filechangecounter dbsize firstfreelisttrunkpage '
+                     'totalfreelistpages schemacookie schemaformat '
+                     'defaultpagecachesize largestrootbtreepage '
+                     'textencoding userversion vacuummode applicationID '
+                     'reserved validfor version usablepagesize '
+                     'inheadersizevalid')
 
-    # check all below this line
+        # parse bytes according to Database Header Format
+        fmt = '>16sH' + 'B'*6 + 'I'*12 + '20sII'
+        parsed = _unpack_from(fmt, data)
 
-    def page_is_in_wal(s, pagenumber):
-        ''' return True if page is in WAL file, False otherwise '''
+        headerstring = parsed[0].decode('utf-8')
+        if headerstring != 'SQLite format 3\x00':
+            raise ValueError('header string should be SQLite format 3\x00')
+
+        # database page size in bytes. Size 1 means 65536
+        pagesize = parsed[1]
+        if pagesize == 1:
+            pagesize = 65536
+        if pagesize not in [1] + [512 * i for i in range(1, 65)]:
+            raise ValueError('pagesize must be a power of two between 512 '
+                             'and 32768 inclusive or the value 1 to represent '
+                             'page size of 65536')
+
+        # file format write version. 1 for legacy; 2 for WAL.
+        writeversion = parsed[2]
+        if writeversion not in [1, 2]:
+            raise ValueError('write version should be 1 or 2')
+
+        # file format read version. 1 for legacy; 2 for WAL.
+        readversion = parsed[3]
+        if readversion not in [1, 2]:
+            raise ValueError('read version should be 1 or 2')
+
+        # Bytes of unused "reserved" space at the of each page. Usually 0.
+        reservedspace = parsed[4]
+
+        # maximum embedded payload fraction.
+        maxpayloadfraction = parsed[5]
+        if maxpayloadfraction != 64:
+            raise ValueError('Max embedded payload fraction != 64')
+
+        # minimum embedded payload fraction.
+        minpayloadfraction = parsed[6]
+        if minpayloadfraction != 32:
+            raise ValueError('Min embedded payload fraction != 32')
+
+        # Leaf payload fraction.
+        leafpayloadfraction = parsed[7]
+        if leafpayloadfraction != 32:
+            raise ValueError('Leaf payload fraction must != 32')
+
+        # File change counter. Note: the change counter
+        # might not be incremented on each transaction in WAL mode.
+        filechangecounter = parsed[8]
+
+        # Size of the database file in pages, a.k.a. the "in-header
+        # database size".
+        dbsize = parsed[9]
+
+        # Page number of the first freelist trunk page.
+        firstfreelisttrunkpage = parsed[10]
+
+        # Total number of freelist pages.
+        totalfreelistpages = parsed[11]
+
+        # The schema cookie.
+        schemacookie = parsed[12]
+
+        # The schema format number.
+        schemaformat = parsed[13]
+        # NOTE: the schema format is only allowed to be 1 through 4,
+        # but similar to the encoding field, the actual sqlite3
+        # source is a bit more relaxed with it's constraint. In the
+        # amalgamation we find:
+        #
+        # 109651   /*
+        # 109652   ** file_format==1    Version 3.0.0.
+        # 109653   ** file_format==2    Version 3.1.3.  // ALTER TABLE ADD COLUMN
+        # 109654   ** file_format==3    Version 3.1.4.  // ditto but with non-NULL defaults
+        # 109655   ** file_format==4    Version 3.3.0.  // DESC indices.  Boolean constants
+        # 109656   */
+        # 109657   pDb->pSchema->file_format = (u8)meta[BTREE_FILE_FORMAT-1];
+        # 109658   if( pDb->pSchema->file_format==0 ){
+        # 109659     pDb->pSchema->file_format = 1;
+        # 109660   }
+        #
+        # Thus, we allow schemaformat 0 as well.
+        #
+        # Also note that the schemaformat is not used in any way in the rest of
+        # xsqlite's parsing and interpretation.
+        if schemaformat not in [0, 1, 2, 3, 4]:
+            raise ValueError('Supported schema formats are 0,1,2,3,4')
+
+        # Default page cache size.
+        defaultpagecachesize = parsed[14]
+
+        # The page number of the largest root b-tree page
+        # when in auto- or incremental vacuum mode, zero otherwise.
+        largestrootbtreepage = parsed[15]
+
+        # The database text encoding.
+        # Note: while only the encodings 1 through 3 are allowed per the
+        # documentation on the sqlite3 website. We have found several
+        # databases with encoding 0. After some searching through the
+        # sqlite3 amalgamation source we found the following:
+        #
+        # 109621       if( encoding==0 ) encoding = SQLITE_UTF8;
+        #
+        # Thus, an encoding of 0 is also allowed and indicates UTF8
+        _encoding = {0: 'utf-8',
+                     1: 'utf-8',
+                     2: 'utf-16le',
+                     3: 'utf-16be'}
+        textencoding = _encoding[parsed[16]]
+
+        # The "user version" as read and set by the user_version
+        # pragma. Not used by SQLite internally.
+        userversion = parsed[17]
+
+        # True (non-zero) for incremental-vacuum mode. False otherwise.
+        vacuummode = bool(parsed[18])
+
+        # "Application ID" set by PRAGMA application_id.
+        applicationID = parsed[19]
+
+        # 20 bytes reserved for expansion. Must be zero.
+        reserved = int.from_bytes(parsed[20], byteorder='big', signed=False)
+        if reserved != 0:
+            raise ValueError('Data in reserved area of header should be 0x00.')
+
+        # The version-valid-for number
+        validfor = parsed[21]
+
+        # SQLITE_VERSION_NUMBER field
+        version = parsed[22]
+
+        # calculated usable page size
+        usablepagesize = pagesize - reservedspace
+
+        # indicates if in-header database size is valid
+        #   The 'in header database size' is only valid if it is nonzero
+        #   and if the filechange counter matches the validfor number.
+        inheadersizevalid = True
+        if dbsize == 0 or filechangecounter != validfor:
+            inheadersizevalid = False
+
+        return _hdr_t(headerstring, pagesize, writeversion,
+                      readversion, reservedspace, maxpayloadfraction,
+                      minpayloadfraction, leafpayloadfraction,
+                      filechangecounter, dbsize, firstfreelisttrunkpage,
+                      totalfreelistpages, schemacookie, schemaformat,
+                      defaultpagecachesize, largestrootbtreepage,
+                      textencoding, userversion, vacuummode, applicationID,
+                      reserved, validfor, version, usablepagesize,
+                      inheadersizevalid)
+
+
+    def is_page_visible_in_wal(s, pagenumber):
+        ''' return True if page is visible in WAL file, False otherwise '''
 
         if hasattr(s, 'walfile'):
-            walframe = s.walfile.get_page_frame(pagenumber)
-            if walframe is not None:
-                return True
+            return s.walfile.is_page_visible(pagenumber)
         return False
 
 
-
-    def get_pageoffset(s, pagenumber):
-        ''' Get the offset of given page in either main db or WAL file '''
+    def get_page_offset(s, pagenumber):
+        ''' Return offset of visible page in database or WAL for pagenumber '''
 
         if pagenumber < 1:
             raise ValueError('pagenumbers start at 1 in SQLite fileformat')
 
-        if s.page_is_in_wal(pagenumber):
+        if s.header.inheadersizevalid:
+            if pagenumber > s.header.dbsize:
+                raise ValueError('pagenumber > inheader dbsize')
+
+        if s.is_page_visible_in_wal(pagenumber):
             # return the offset of the page data in the WAL file
-            walframe = s.walfile.get_page_frame(pagenumber)
+            walframe = s.walfile.get_visible_page_frame(pagenumber)
             return walframe.contents_offset
 
-        # if we get here, check if the page is within bounds
-        if s.header.inheadersizevalid and pagenumber > s.header.dbsize:
-            raise _exceptions.InvalidArgumentException('pagenumber points beyond EOF')
-        if not s.header.inheadersizevalid and pagenumber > s.header.externalsize:
-            raise _exceptions.InvalidArgumentException('pagenumber points beyond EOF')
+        if pagenumber > s.externalsize:
+            raise ValueError('pagenumber > externalsize')
 
         # return the offset in the main database
         return (pagenumber - 1) * s.header.pagesize
 
 
     def get_page_data(s, pagenumber):
-        ''' function that returns the page as block object '''
+        ''' Return visible page data for given pagenumber '''
 
-        # first check if we should get the page from the main database or from the WAL
-        if hasattr(s, 'walfile'):
-            walframe = s.walfile.get_page_frame(pagenumber)
-            if walframe is not None:
-                return walframe.contents
+        if s.is_page_visible_in_wal(pagenumber):
+            walframe = s.walfile.get_visible_page_frame(pagenumber)
+            return walframe.contents
 
-        start = s.get_pageoffset(pagenumber)
+        start = s.get_page_offset(pagenumber)
         end = start + s.header.pagesize
         return s.data[start:end]
 
 
-
     def get_btreepage(s, pagenumber):
-        ''' Parse given page as btree page and return a parsed page
+        ''' Parse the visible page for given pagenumber as Btree Page '''
 
-        A page object is a simple object combining a pagenumber, pageoffset and a
-        parsed page. This function is a wrapper for _structures.btree_page.
-        '''
+        # get the page offset
+        offset = s.get_page_offset(pagenumber)
 
-        # TODO: this is incorrect, we need to pass in either s.data or walfile
-        # data, depending on page source
-        raise ValueError("work in progress")
-
-        pg_offset = s.get_pageoffset(pagenumber)
-        # TODO: instead of slicing, pass the correct mmapped data (main or wal)
-        # and the pg_offset into _structures.btree_page?
-        pg_data = s.get_page_data(pagenumber)
-        # start with the page with the given pagenumber
-        isheaderpage = False
-        if pagenumber == 1:
-            isheaderpage = True
-
-        if s.page_is_in_wal(pagenumber):
-            pg_source = PageSource.WalFile
+        if s.is_page_visible_in_wal(pagenumber):
+            pagesource = PageSource.WALFile
+            data = s.walfile.data
         else:
-            pg_source = PageSource.DatabaseFile
+            pagesource = PageSource.DatabaseFile
+            data = s.data
 
-        page = BtreePage(s.data, pg_offset, pagenumber, s.header.pagesize,
-                         pg_source, s.header.usablepagesize)
-        return page
-        # use offset 0 here, since data contains only the single page to be parsed
-        #page = _structures.btree_page(pg_data, 0, s.header.pagesize, s.header.usablepagesize, isheaderpage)
-        #return Page(pg_data, page, pagenumber, pg_offset, from_wal)
+        return BtreePage(data, offset, pagenumber, s.header.pagesize,
+                         pagesource, s.header.usablepagesize)
 
+
+    def freelist_pages(s):
+        ''' Generate sequence of visible freelist pages in database '''
+
+        def _fpages(pnum):
+            ''' yields all freelist pages starting at the given trunkpage '''
+
+            # when the next freelist trunkpage number is 0, we are done
+            if pnum == 0:
+                return
+
+            # get the page offset
+            offset = s.get_page_offset(pnum)
+
+            if s.is_page_visible_in_wal(pnum):
+                pagesource = PageSource.WALFile
+                data = s.walfile.data
+            else:
+                pagesource = PageSource.DatabaseFile
+                data = s.data
+
+            # parse and yield the freelist trunkpage
+            tpage = FreeListTrunkPage(data, offset, pnum, s.header.pagesize,
+                                      pagesource, s.header.usablepagesize)
+            yield tpage
+
+            # yield all pages pointed to by the leaf pointers in the trunkpage
+            for pnum in tpage.freelistleafpointers:
+                offset = s.get_page_offset(pnum)
+                if s.is_page_visible_in_wal(pnum):
+                    pagesource = PageSource.WALFile
+                    data = s.walfile.data
+                else:
+                    pagesource = PageSource.DatabaseFile
+                    data = s.data
+
+                lpage = FreeListLeafPage(data, offset, pnum,
+                                         s.header.pagesize, pagesource,
+                                         s.header.usablepagesize)
+                yield lpage
+
+            # process the next FreeList Trunk Page
+            for pg in _fpages(tpage.nextfreelisttrunkpage):
+                yield pg
+
+        for pg in _fpages(s.header.firstfreelisttrunkpage):
+            yield pg
+
+
+# WORK IN PROGRESS BELOW THIS LINE #
 
     def get_page_by_rowid(s, rootpagenumber, rowid):
-        ''' Returns the page that should contain the record with the given rowid.
+        ''' Find the page that (should) hold the record with given rowid
 
-        The term 'should' is chosen deliberately: When a record is removed it is no longer
-        accessible on the corresponding page, but when navigating the tree you still end up on the
-        same page. Also, when you start the search on a page that is in the wrong subtree, you will
-        end up with the wrong page altogether, so you should call this with the root page of the
-        table that you are interested in. Finally, if the rowid is larger than the highest stored
-        rowid, you will receive the last page in the btree, regardless of whether or not the rowid
-        is actually stored there.
-
-        Uses the btreepage function to return a page object, see documentation there for details on
-        the returnvalue.  '''
+        The term 'should' is chosen deliberately: When a record is removed it
+        is no longer accessible on the corresponding page, but when navigating
+        the tree you still end up on the same page. Also, when you start the
+        search on a page that is in the wrong subtree, you will end up with the
+        wrong page altogether, so you should call this with the root page of
+        the table that you are interested in. Finally, if the rowid is larger
+        than the highest stored rowid, you will receive the last page in the
+        btree, regardless of whether or not the rowid is actually stored there.
+        '''
 
         rootpage = s.get_btreepage(rootpagenumber)
 
         if rootpage.page.pagetype not in ['table_leaf', 'table_interior']:
-            raise _exceptions.InvalidArgumentException('need the pagenumber of a table page')
+            raise ValueError('need the pagenumber of a table page')
 
         if rootpage.page.pagetype == 'table_leaf':
             return rootpage
@@ -361,51 +540,6 @@ class Database():
         return None
 
 
-    def freelist_pages(s):
-        ''' Generates a sequence of all freelist pages in the database. '''
-
-        def _fpages(pnum):
-            ''' yields all freelist pages starting at the given trunkpage '''
-
-            # when the next freelist trunkpage number is 0, we are done
-            if pnum == 0:
-                return
-
-            # get the page offset
-            pageoffset = s.get_pageoffset(pnum)
-
-            if s.page_is_in_wal(pnum):
-                pagesource = PageSource.WALFile
-                data_obj = s.walfile.data
-            else:
-                pagesource = PageSource.DatabaseFile
-                data_obj = s.data
-
-            # parse and yield the freelist trunkpage
-            tpage = FreeListTrunkPage(data_obj, pageoffset, pnum, s.header.pagesize,
-                                      pagesource, s.header.usablepagesize)
-            yield tpage
-
-            # yield all pages pointed to by the leaf pointers in the trunkpage
-            for pnum in tpage.freelistleafpointers:
-                pageoffset = s.get_pageoffset(pnum)
-                if s.page_is_in_wal(pnum):
-                    pagesource = PageSource.WALFile
-                else:
-                    pagesource = PageSource.DatabaseFile
-                lpage = FreeListLeafPage(s.data, pageoffset, pnum,
-                                         s.header.pagesize, pagesource,
-                                         s.header.usablepagesize)
-                yield lpage
-
-            # process the next FreeList Trunk Page
-            for pg in _fpages(tpage.nextfreelisttrunkpage):
-                yield pg
-
-        for pg in _fpages(s.header.firstfreelisttrunkpage):
-            yield pg
-
-
     def superseded_pages(s):
         ''' Generates a sequence of all pages that have been superseded by a WAL page
 
@@ -425,7 +559,7 @@ class Database():
             # main database, so we can skip over these
             if s.header.inheadersizevalid and pagenumber > s.header.dbsize:
                 continue
-            if not s.header.inheadersizevalid and pagenumber > s.header.externalsize:
+            if not s.header.inheadersizevalid and pagenumber > s.externalsize:
                 continue
 
             # determine the pageoffset within the main database file
