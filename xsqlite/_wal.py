@@ -49,12 +49,11 @@ class WalFile():
     frames within the WAL are valid and which are leftovers from prior
     checkpoints.  '''
 
-    def __init__(s, file, usablepagesize):
+    def __init__(s, file):
         ''' initialize a WAL file object from the given file
 
         Arguments:
         - file           : filename, a file-like object or an mmapped file
-        - usablepagesize : usable page size as defined in main db header
 
         Returns:
         - WalFile : initialized WALFile object
@@ -78,9 +77,6 @@ class WalFile():
             s.data = _mmap.mmap(file.fileno(), 0, access=_mmap.ACCESS_READ)
         else:
             raise ValueError("expected filename, mmapped file or file-like object")
-
-        # store the usable page size so we can parse frames as Btree Pages
-        s.usablepagesize = usablepagesize
 
         # wal file size
         s.filesize = s.data.size()
@@ -162,14 +158,7 @@ class WalFile():
         # checkpointer by building two dictionaries: One with a mapping of pagenumber to framenumber
         # for the latest (i.e. up to date) frame and one with a mapping of pagenumber to a list
         # of outdated/superseded framenumbers
-        s._determine_checkpoint_frames()
-
-        # We now have two dictionaries with the most recent and the outdated frames. These are used
-        # as the basis for three functions to the WalFile API:
-        #
-        # - get_page_frame    : returns the most recent page frame for the given pageframe
-        # - superseded_frames : generates frames below mxFrame that are superseded by a newer frame
-        # - allocated_frames  : generates the most recent page frames
+        s._determine_visible_frames()
 
 
     def walheader(s, data, offset=0):
@@ -178,8 +167,6 @@ class WalFile():
 
         _walheader = _nt('wal_header', 'magic file_format_version pagesize checkpoint_sequence_number '
                                        'salt1 salt2 checksum1 checksum2 checksum_endianness')
-
-
 
         fmt = '>IIIIIIII'
         parsed = _unpack_from(fmt, data, offset)
@@ -192,9 +179,10 @@ class WalFile():
         pagesize = parsed[2]
         # Checkpoint sequence number
         checkpoint_sequence_number = parsed[3]
-        # Random integer incremented with each checkpoint
+        # Random integer incremented with each WAL reset
+        # can be seen as a WAL-generation identifier
         salt1 = parsed[4]
-        # Different random number for each checkpoint
+        # Different random number for each WAL reset
         salt2 = parsed[5]
         # checksum1: First part of a checksum on the first 24 bytes of header
         checksum1 = parsed[6]
@@ -232,7 +220,6 @@ class WalFile():
         return _walheader(magic, file_format_version, pagesize,
                           checkpoint_sequence_number, salt1,
                           salt2, checksum1, checksum2, endianness)
-
 
 
     def _determine_last_valid_checksum(s):
@@ -339,18 +326,19 @@ class WalFile():
     def _determine_mxFrame(s):
         ''' determine the last valid frame that is also a commit frame '''
 
-        # At the start of the source wal.c within the amalgamation file, we see:
+        # At the start of the source file wal.c we can read:
 
-        #    To read a page from the database (call it page number P), a reader first
-        #    checks the WAL to see if it contains page P. If so, then the last valid
-        #    instance of page P that is followed by a commit frame or is a commit frame
-        #    itself becomes the value read. If the WAL contains no copies of page P
-        #    that are valid and which are a commit frame or are followed by a commit
-        #    frame, then page P is read from the database file.
+        #    To read a page from the database (call it page number P), a reader
+        #    first checks the WAL to see if it contains page P. If so, then the
+        #    last valid instance of page P that is followed by a commit frame
+        #    or is a commit frame itself becomes the value read. If the WAL
+        #    contains no copies of page P that are valid and which are a commit
+        #    frame or are followed by a commit frame, then page P is read from
+        #    the database file.
 
-        # This indicates that the last page frame for a given pagenumber represents
-        # the most recent version of the page, as long as it is a commit frame, or if
-        # it is followed by a commit frame.
+        # This indicates that the last page frame for a given pagenumber
+        # represents the most recent version of the page, as long as it is a
+        # commit frame, or if it is followed by a commit frame.
 
         # Concerning the shm file, we can also read:
 
@@ -380,81 +368,34 @@ class WalFile():
         for fnum in range(1, last_valid_frame + 1):
             frame = s.get_frame(fnum)
             # check if this is also a commit frame
-            if frame.header.commit_page_count != 0:
+            if frame.is_commit_frame is True:
                 # this is a commit frame, update mxFrame value
                 s.mxFrame = fnum
 
 
-    def _determine_checkpoint_frames(s):
-        ''' determines the latest frame for each pagenumber, similar to a checkpoint operation
+    def _determine_visible_frames(s):
+        ''' Find visible frames up to mxFrame for checkpoint reconstruction
 
-        This function creates a dictionary mapping the pagenumber to the frameindex
-        for the last (most recent) version of each page frame, and a dictionary mapping
-        each pagenumber to a sequence of outdated, but valid page frames.
-        '''
+        This function creates a dictionary that maps the pagenumber to the
+        framenumebr for the last (most recent) version of each page frame below
+        mxFrame. It also creates a dictionary that maps pagenumbers to a
+        sequence of outdated, but valid framenumbers '''
 
-        # From the amalgamation a note on the waliterator struct:
-        #
-        #     this structure is used to implement an iterator that loops through
-        #     all frames in the wal in database page order. where two or more frames
-        #     correspond to the same database page, the iterator visits only the
-        #     frame most recently written to the wal (in other words, the frame with
-        #     the largest index)
-        #
-        # Further down, in the walCheckpoint function we see the following:
-        #
-        #     /* Iterate through the contents of the WAL, copying data to the db file */
-        #     while( rc==SQLITE_OK && 0==walIteratorNext(pIter, &iDbpage, &iFrame) ){
-        #       i64 iOffset;
-        #       assert( walFramePgno(pWal, iFrame)==iDbpage );
-        #       if( iFrame<=nBackfill || iFrame>mxSafeFrame || iDbpage>mxPage ){
-        #         continue;
-        #       }
-        #       iOffset = walFrameOffset(iFrame, szPage) + WAL_FRAME_HDRSIZE;
-        #       /* testcase( IS_BIG_INT(iOffset) ); // requires a 4GiB WAL file */
-        #       rc = sqlite3OsRead(pWal->pWalFd, zBuf, szPage, iOffset);
-        #       if( rc!=SQLITE_OK ) break;
-        #       iOffset = (iDbpage-1)*(i64)szPage;
-        #       testcase( IS_BIG_INT(iOffset) );
-        #       rc = sqlite3OsWrite(pWal->pDbFd, zBuf, szPage, iOffset);
-        #       if( rc!=SQLITE_OK ) break;
-        #     }
-        #
-        # Here we see a call to the walItereratorNext function, which is documented
-        # as follows:
-        #
-        #     Find the smallest page number out of all pages held in the WAL that
-        #     has not been returned by any prior invocation of this method on the
-        #     same WalIterator object.   Write into *piFrame the frame index where
-        #     that page was last written into the WAL.  Write into *piPage the page
-        #     number.
-        #
-        # From this we can infer that for each valid frame, only the latest version
-        # for a particular page number is actually to be copied back into the main database
-        # file. From this, in turn, we can classify all but the last wal frame for a
-        # particular page as outdated/unallocated.
-        #
-        # Another snippet from this page: https://sqlite.org/wal.html
-        #
-        # The checkpointer makes an effort to do as many sequential page writes
-        # to the database as it can (the pages are transferred from WAL to database in
-        # ascending order) '''
-
-        s._checkpoint_frames = {}
+        s._visible_frames = {}
         s._superseded_frames = {}
 
         for i in range(1, s.mxFrame + 1):
             frame = s.get_frame(i)
             pgnum = frame.header.pagenumber
-            if pgnum in s._checkpoint_frames:
+            if pgnum in s._visible_frames:
                 # the old version is superseded
-                old_framenumber = s._checkpoint_frames[pgnum]
+                old_framenumber = s._visible_frames[pgnum]
                 if pgnum in s._superseded_frames:
                     s._superseded_frames[pgnum].append(old_framenumber)
                 else:
                     s._superseded_frames[pgnum] = [old_framenumber]
             # add the current page to the checkpoint frames
-            s._checkpoint_frames[pgnum] = i
+            s._visible_frames[pgnum] = i
 
 
     def _frame_offset(s, framenumber):
@@ -490,7 +431,7 @@ class WalFile():
         These frames all exist below mxFrame and are the most recent version for their pagenumber
         '''
 
-        for pnum, framenum in s._checkpoint_frames.items():
+        for pnum, framenum in s._visible_frames.items():
             yield s.get_frame(framenum)
 
 
@@ -502,13 +443,26 @@ class WalFile():
                 yield s.get_frame(framenum)
 
 
-    def get_page_frame(s, pagenum):
-        ''' return the frame for the given pagenumber, or None if it doesn't exist '''
+    def get_visible_page_frame(s, pagenum):
+        ''' Return the visible frame for the given pagenumber
 
-        if pagenum in s._checkpoint_frames:
-            return s.get_frame(s._checkpoint_frames[pagenum])
+        Arguments:
+        - pagenum : pagenumber
+
+        Returns:
+        - frame   : visible frame for given page, or None
+        '''
+
+        if pagenum in s._visible_frames:
+            return s.get_frame(s._visible_frames[pagenum])
         else:
             return None
+
+
+    def is_page_visible(s, pagenum):
+        ''' return True if given pagenumber has a visible frame '''
+
+        return pagenum in s._visible_frames
 
 
     def outdated_frames(s):
@@ -527,6 +481,8 @@ class WalFile():
 
         All generated pages originate from the frames in the WAL file prior to the mxFrame '''
 
+        # TODO: move this to database object?
+
         # pages from the WAL file that have been superseded by a page from a later WAL frame
         for frame in s.superseded_frames():
             try:
@@ -536,11 +492,13 @@ class WalFile():
                 #raise ValueError("Work in progress, detect other page types")
 
 
-    def outdated_pages(s):
+    def outdated_pages(s, usablepagesize):
         ''' generate a sequence of pages from WAL file that are beyond mxFrame
 
         These pages have been checkpointed during an earlier checkpoint operation and
         are no longer part of the database state '''
+
+        # TODO: move this to database object?
 
         # pages from the WAL file that have been superseded by a page from a later WAL frame
         for frame in s.outdated_frames():
@@ -555,12 +513,41 @@ class WalFile():
 
         offset = frame.contents_offset
         try:
-            return BtreePage(s.data, offset, frame.pagenumber, 
+            return BtreePage(s.data, offset, frame.pagenumber,
                              s.pagesize, PageSource.WALFile,
                              usablepagesize)
         except:
             raise
             raise ValueError("Work in progress, detect other page types")
+
+
+    def get_snapshot_frames(s):
+        ''' Return consistent snapshots for each commit frame up to mxFrame
+
+        A snapshot is a consistent database view reconstructed based on valid
+        frames up to a commit frame. Only the commit frames up to the mxFrame
+        and of the current WAL generation (salt1) can lead to a consistent
+        database view. Frames left over from a previous WAL generation
+        (outdated frames) can not be used to reconstruct a consistent database
+        view.
+        
+        Note that these snapshots need to be combined with the main database
+        file to get a consistent view.
+
+        Also note that the last snapshot should be equal to _visible_frames
+        '''
+        # store the snapshots in a list
+        snapshots = []
+        snapshot = {}
+        # iterate over the frames up to and including mxFrame
+        for i in range(1, s.mxFrame + 1):
+            frame = s.get_frame(i)
+            # store the highest framenumber for the given pagenumber
+            snapshot[frame.pagenumber] = frame.framenumber
+            if frame.is_commit_frame is True:
+                # store copy of current visible pages as a snapshot
+                snapshots.append({k:v for k,v in snapshot.items()})
+        return snapshots
 
 
 class WalFrame():
@@ -584,7 +571,11 @@ class WalFrame():
         # and promote properties to be walframe properties
         # TODO: remove these, instead use reference to walframe header everywhere
         s.pagenumber = s.header.pagenumber
-        s.commit_page_count = s.header.commit_page_count
+        if s.header.dbsize != 0:
+            s.is_commit_frame = True
+        else:
+            s.is_commit_frame = False
+
         s.salt1 = s.header.salt1
         s.salt2 = s.header.salt2
         s.checksum1 = s.header.checksum1
@@ -597,27 +588,27 @@ class WalFrame():
         A walheader contains the following fields:
 
             - pagenumber: Page number
-            - commit_page_count: For commit records, the size of the database file in pages after the
-                                 commit. For all other records, zero.
+            - dbsize: For commit records, the size of the database file in pages after the
+                      commit. For all other records, zero.
             - salt1: Salt-1 copied from the WAL header
             - salt2: Salt-2 copied from the WAL header
             - checksum1: Cumulative checksum up through and including this page
             - checksum2: Second half of the cumulative checksum
         '''
 
-        _wal_frame_header = _nt('wal_frame_header', 'pagenumber commit_page_count salt1 salt2 '
+        _wal_frame_header = _nt('wal_frame_header', 'pagenumber dbsize salt1 salt2 '
                                                 'checksum1 checksum2')
         fmt = '>IIIIII'
         parsed = _unpack_from(fmt, data, offset)
 
         pagenumber = parsed[0]
-        commit_page_count = parsed[1]
+        dbsize = parsed[1]
         salt1 = parsed[2]
         salt2 = parsed[3]
         checksum1 = parsed[4]
         checksum2 = parsed[5]
 
-        return _wal_frame_header(pagenumber, commit_page_count, salt1, salt2, checksum1, checksum2)
+        return _wal_frame_header(pagenumber, dbsize, salt1, salt2, checksum1, checksum2)
 
 
     def compute_checksum(s, endianness, init_checksum1=0, init_checksum2=0):
@@ -647,6 +638,5 @@ class WalFrame():
 
         c1,c2 = walchecksum(integers, init_checksum1, init_checksum2)
         return (c1, c2)
-
 
 
