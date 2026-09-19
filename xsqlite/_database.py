@@ -704,7 +704,7 @@ class Database():
             # get the page_data from the main database file, not via page_data API
             data = s.data[pageoffset:pageoffset+s.header.pagesize]
             # unpack as a generic page
-            page = _structures.genericpage(data, 0, s.header.pagesize)
+            page = genericpage(data, 0, s.header.pagesize)
             from_wal = False
             yield Page(data, page, pagenumber, pageoffset, from_wal)
 
@@ -953,3 +953,37 @@ class RowidRecord():
         definedsize = sum(sizes) + recdata.header.headersize
         if definedsize != s.payloadsize:
             raise RuntimeError('mismatch between size in recordheader and payloadsize.')
+
+
+# TODO: this is copied from _structures for now, remove later
+
+################
+# generic page #
+################
+
+# a basic page that treats all data as unallocated
+
+# generic page fields:
+# - pagetype: 'unknown'
+# - unallocated_offset: relative offset of the unallocate space (0)
+# - unallocated: the data stored in the unallocated area for this page
+# - unallocated_size : size of the unallocated space
+# - size: the page size (passed in as variable)
+_genericpage = _nt('genericpage', 'pagetype unallocated_offset unallocated '
+                                  'unallocated_size size')
+
+
+def genericpage(data, offset, pagesize):
+    ''' Parses data at given offset as generic (unallocated) page.
+
+    Arguments:
+
+    - data           : bytes containing the page
+    - offset         : offset of the page within the data
+    - pagesize       : the size of a database page
+
+    Returns:
+    - genericpage     : 'parsed' generic page
+    '''
+    return _genericpage('unknown', 0, data[offset:offset+pagesize], 
+                        pagesize, pagesize)
