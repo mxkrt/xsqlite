@@ -521,6 +521,32 @@ class WalFile():
             raise ValueError("Work in progress, detect other page types")
 
 
+    def parse_frame_page(s, framenumber, usablepagesize):
+        ''' attempt to parse the frame with given framenumber as Btree Page '''
+
+        frame = s.get_frame(framenumber)
+        offset = frame.contents_offset
+        try:
+            return BtreePage(s.data, offset, frame.pagenumber,
+                             s.pagesize, PageSource.WALFile,
+                             usablepagesize)
+        except:
+            raise
+            raise ValueError("Work in progress, detect other page types")
+
+
+    def _page_history(s, pgnum, usablepagesize):
+        ''' simple idea to show page history in superseded frames '''
+
+        for fnum in s._superseded_frames[pgnum]:
+            pg = s.parse_frame_page(fnum, usablepagesize)
+            yield pg
+        # and the final current state
+        fnum = s._visible_frames[pgnum]
+        pg = s.parse_frame_page(fnum, usablepagesize)
+        yield pg
+
+
     def get_snapshot_frames(s):
         ''' Return consistent snapshots for each commit frame up to mxFrame
 

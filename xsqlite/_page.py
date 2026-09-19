@@ -79,6 +79,9 @@ class Page():
     def get_unallocated(s):
         ''' return bytes in the unallocated area '''
 
+        if s.unallocated_size is None:
+            return None
+
         start = s.offset + s.unallocated_offset
         end = start + s.unallocated_size
         return s._data[start:end]
@@ -646,3 +649,56 @@ class FreeListLeafPage(Page):
 
         # initialize superclass
         super().__init__()
+
+
+#################
+# Overflow Page #
+#################
+
+
+class OverflowPage(Page):
+    ''' Class representing a Payload Overflow Page '''
+
+    def __init__(s, data, offset, pagenum, pagesize, pagesource, usablepagesize):
+        ''' initialize an Overflow Page from given data at given offset
+
+        Arguments:
+        - data           : data containing the page at given offset
+        - offset         : offset of the page structure
+        - pagenum        : the pagenumber (derived from offset or wal frame)
+        - pagesize       : the size of the page (derived from database header)
+        - pagesource     : PageSource value (DatabaseFile or WalFile)
+        - usablepagesize : usable page size as calculated from database header
+       '''
+
+        s._data = data
+        s.offset = offset
+        s.size = pagesize
+        s.pagenum = pagenum
+        s.pagesource = pagesource
+        s.usablepagesize = usablepagesize
+        s.pagetype = PageType.PayloadOverflow
+        s.unallocated_offset = None
+        s.unallocated_size = None
+
+        # header consists of a single field with the pagenumber
+        # of the next overflow page or 0 for end of chain
+        s.next_overflow_page = _unpack_from('>I', s._data, s.offset)[0]
+        s.contents_offset = 4
+        s.contents_size = s.usablepagesize - 4
+        # initialize superclass
+        super().__init__()
+
+
+    def get_contents(s):
+        ''' return the contents stored in this overflow page
+
+        Note that the last overflow page in a chain may not completely contain
+        payload data. In other words, there may be slack in the chained overflow
+        pages. This has to be determined by the caller, because for this
+        cell-specific information is needed (the payloadsize).
+        '''
+
+        start = s.offset + 4
+        end = start + s.contents_size
+        return s._data[start:end]

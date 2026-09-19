@@ -24,6 +24,7 @@ from . import _decode
 from ._wal import WalFile
 from ._page import PageSource, PageType, Page, BtreePage
 from ._page import FreeListLeafPage, FreeListTrunkPage
+from ._page import OverflowPage
 from ._sqlitemaster import SQLiteMaster
 
 
@@ -59,9 +60,9 @@ class Database():
         # parse the database header from page 1
         if s.is_page_visible_in_wal(1) is True:
             hdr_frame = s.walfile.get_visible_page_frame(1)
-            s.header = s._parse_header(hdr_frame.contents[0:100])
+            s.header = s.parse_header(hdr_frame.contents[0:100])
         else:
-            s.header = s._parse_header(s.data[0:100])
+            s.header = s.parse_header(s.data[0:100])
 
         # calculated size of database in pages based on available data
         s.externalsize = int(len(s.data) / s.header.pagesize)
@@ -157,7 +158,7 @@ class Database():
                         s.journaldata = _mmap.mmap(jfile.fileno(), 0, access=_mmap.ACCESS_READ)
 
 
-    def _parse_header(s, data):
+    def parse_header(s, data):
         ''' Parse the database header in given 100 bytes '''
 
         # namedtuple representing the database header
@@ -331,7 +332,7 @@ class Database():
         return False
 
 
-    def get_page_offset(s, pagenumber):
+    def page_offset(s, pagenumber):
         ''' Return offset of visible page in database or WAL for pagenumber '''
 
         if pagenumber < 1:
@@ -353,23 +354,23 @@ class Database():
         return (pagenumber - 1) * s.header.pagesize
 
 
-    def get_page_data(s, pagenumber):
-        ''' Return visible page data for given pagenumber '''
+    def page_data(s, pagenumber):
+        ''' Return page data for visible page with given pagenumber '''
 
         if s.is_page_visible_in_wal(pagenumber):
             walframe = s.walfile.get_visible_page_frame(pagenumber)
             return walframe.contents
 
-        start = s.get_page_offset(pagenumber)
+        start = s.page_offset(pagenumber)
         end = start + s.header.pagesize
         return s.data[start:end]
 
 
-    def get_btreepage(s, pagenumber):
+    def btreepage(s, pagenumber):
         ''' Parse the visible page for given pagenumber as Btree Page '''
 
         # get the page offset
-        offset = s.get_page_offset(pagenumber)
+        offset = s.page_offset(pagenumber)
 
         if s.is_page_visible_in_wal(pagenumber):
             pagesource = PageSource.WALFile
@@ -382,6 +383,57 @@ class Database():
                          pagesource, s.header.usablepagesize)
 
 
+    def freelisttrunkpage(s, pagenumber):
+        ''' Parse the visible page for given pagenumber as Freelist Trunk Page '''
+
+        # get the page offset
+        offset = s.page_offset(pagenumber)
+
+        if s.is_page_visible_in_wal(pagenumber):
+            pagesource = PageSource.WALFile
+            data = s.walfile.data
+        else:
+            pagesource = PageSource.DatabaseFile
+            data = s.data
+
+        return FreeListTrunkPage(data, offset, pagenumber, s.header.pagesize,
+                                 pagesource, s.header.usablepagesize)
+
+
+    def freelistleafpage(s, pagenumber):
+        ''' Parse the visible page for given pagenumber as Freelist Leaf Page '''
+
+        # get the page offset
+        offset = s.page_offset(pagenumber)
+
+        if s.is_page_visible_in_wal(pagenumber):
+            pagesource = PageSource.WALFile
+            data = s.walfile.data
+        else:
+            pagesource = PageSource.DatabaseFile
+            data = s.data
+
+        return FreeListLeafPage(data, offset, pagenumber, s.header.pagesize,
+                                pagesource, s.header.usablepagesize)
+
+
+    def overflowpage(s, pagenumber):
+        ''' Parse the visible page for given pagenumber as Overflow Page '''
+
+        # get the page offset
+        offset = s.page_offset(pagenumber)
+
+        if s.is_page_visible_in_wal(pagenumber):
+            pagesource = PageSource.WALFile
+            data = s.walfile.data
+        else:
+            pagesource = PageSource.DatabaseFile
+            data = s.data
+
+        return OverflowPage(data, offset, pagenumber, s.header.pagesize,
+                            pagesource, s.header.usablepagesize)
+
+
     def freelist_pages(s):
         ''' Generate sequence of visible freelist pages in database '''
 
@@ -392,35 +444,12 @@ class Database():
             if pnum == 0:
                 return
 
-            # get the page offset
-            offset = s.get_page_offset(pnum)
-
-            if s.is_page_visible_in_wal(pnum):
-                pagesource = PageSource.WALFile
-                data = s.walfile.data
-            else:
-                pagesource = PageSource.DatabaseFile
-                data = s.data
-
-            # parse and yield the freelist trunkpage
-            tpage = FreeListTrunkPage(data, offset, pnum, s.header.pagesize,
-                                      pagesource, s.header.usablepagesize)
+            tpage = s.freelisttrunkpage(pnum)
             yield tpage
 
             # yield all pages pointed to by the leaf pointers in the trunkpage
             for pnum in tpage.freelistleafpointers:
-                offset = s.get_page_offset(pnum)
-                if s.is_page_visible_in_wal(pnum):
-                    pagesource = PageSource.WALFile
-                    data = s.walfile.data
-                else:
-                    pagesource = PageSource.DatabaseFile
-                    data = s.data
-
-                lpage = FreeListLeafPage(data, offset, pnum,
-                                         s.header.pagesize, pagesource,
-                                         s.header.usablepagesize)
-                yield lpage
+                yield s.freelistleafpage(pnum)
 
             # process the next FreeList Trunk Page
             for pg in _fpages(tpage.nextfreelisttrunkpage):
@@ -430,62 +459,24 @@ class Database():
             yield pg
 
 
-# WORK IN PROGRESS BELOW THIS LINE #
+    def btreewalker(s, rootpagenumber):
+        ''' Generate Btree pages starting at given rootpage number.
 
-    def get_page_by_rowid(s, rootpagenumber, rowid):
-        ''' Find the page that (should) hold the record with given rowid
+        The generated sequence represents the subtree under the given page.
+        Both the interior and the leaf table pages are returned so that this
+        can be used for both index and table trees (index pages contain data,
+        especially for WITHOUT_ROWID tables). Normally one should call this
+        with the rootpage of a table or index, but you can also start at a
+        lower level in the tree.
 
-        The term 'should' is chosen deliberately: When a record is removed it
-        is no longer accessible on the corresponding page, but when navigating
-        the tree you still end up on the same page. Also, when you start the
-        search on a page that is in the wrong subtree, you will end up with the
-        wrong page altogether, so you should call this with the root page of
-        the table that you are interested in. Finally, if the rowid is larger
-        than the highest stored rowid, you will receive the last page in the
-        btree, regardless of whether or not the rowid is actually stored there.
-        '''
-
-        rootpage = s.get_btreepage(rootpagenumber)
-
-        if rootpage.page.pagetype not in ['table_leaf', 'table_interior']:
-            raise ValueError('need the pagenumber of a table page')
-
-        if rootpage.page.pagetype == 'table_leaf':
-            return rootpage
-
-        if rootpage.page.pagetype == 'table_interior':
-            if rowid > rootpage.page.cells[-1].key:
-                # go right: rmp points to subtree were keys are > cells[-1].key
-                return s.get_page_by_rowid(rootpage.page.header.rightmost_pointer, rowid)
-            else:
-                # go left :leftpointer points to pages were all keys are <= key
-                # from documentation: pointers to the left of a X refer to b-tree
-                # pages on which all keys are less than or equal to X.
-                for cell in rootpage.page.cells:
-                    lp = cell.left_child_pointer
-                    if rowid <= cell.key:
-                        return s.get_page_by_rowid(lp, rowid)
-
-
-    def treewalker(s, rootpagenumber):
-        ''' Generates a sequence of btree pages starting at given pagenumber. The
-        generated sequence represents the subtree under the given page. Both
-        the interior and the leaf table pages are returned so that this can be used
-        for both index and table trees (index pages contain data, especially for
-        WITHOUT_ROWID tables). Normally one should call this with the rootpage of a
-        table or index, but you can also start at a lower level in the tree.
-
-        Pages from subtrees are yielded in the same order as they are stored in the
-        b-tree, so natural ordering by the table's key (mostly rowid) is honoured.
-        The interior pages are yielded prior to descending into the subtree defined
-        by the corresponding interior page.
-
-        Uses the get_btreepage function to yield a page object, see documentation
-        there for details on the returnvalue.
+        Pages from subtrees are yielded in the same order as they are stored in
+        the b-tree, so natural ordering by the table's key (mostly rowid) is
+        honoured. The interior pages are yielded prior to descending into the
+        subtree defined by the corresponding interior page.
         '''
 
         # start with the rootpage
-        rootpage = s.get_btreepage(rootpagenumber)
+        rootpage = s.btreepage(rootpagenumber)
         yield rootpage
 
         # visit the children of interior pages
@@ -494,12 +485,157 @@ class Database():
             # first the left pointers
             for cell in rootpage.cells:
                 subpagenum = cell.left_child_pointer
-                for subpage in s.treewalker(subpagenum):
+                for subpage in s.btreewalker(subpagenum):
                     yield subpage
             # and finally the rightmost pointer
             rmp = rootpage.rightmost_pointer
-            for subpage in s.treewalker(rmp):
+            for subpage in s.btreewalker(rmp):
                 yield subpage
+
+
+    def page_by_rowid(s, rootpagenumber, rowid):
+        ''' Return page that holds the record with given rowid
+
+        NOTE: When a record is removed it is no longer accessible on the
+        corresponding page, but the Btree will still lead to a page where the
+        record can be potentially stored (again). Before returning the page it
+        is checked if the rowid actually occurs within the page.  If not, a
+        ValueError is raised, which indicates an allocated record with given
+        rowid does not exist.
+
+        Obviously, this function should be called with the rootpage of the
+        table of interest.
+        '''
+
+        rootpage = s.btreepage(rootpagenumber)
+
+        # a Table Btree Leaf page has no children
+        if rootpage.pagetype == PageType.TableBtreeLeaf:
+            if rowid not in rootpage.rowidmap:
+                msg = f'Btree points to page {rootpage.pagenum}, but no'
+                msg += f' allocated record with rowid {rowid} exists'
+                raise ValueError(msg)
+            return rootpage
+
+        elif rootpage.pagetype == PageType.TableBtreeInterior:
+            if rowid > rootpage.cells[-1].key:
+                # go right: rmp points to subtree were keys are > cells[-1].key
+                return s.page_by_rowid(rootpage.rightmost_pointer, rowid)
+            else:
+                # go left :leftpointer points to pages were all keys are <= key
+                # from documentation: pointers to the left of a X refer to b-tree
+                # pages on which all keys are less than or equal to X.
+                for cell in rootpage.cells:
+                    lp = cell.left_child_pointer
+                    if rowid <= cell.key:
+                        return s.page_by_rowid(lp, rowid)
+
+        else:
+            raise ValueError('Given rootpage is not a Table Btree Page')
+
+
+    def _payload_overflow(s, cell):
+        ''' return payload overflow for given parsed cell '''
+
+        if cell.payloadsize <= len(cell.inline_payload):
+            if cell.first_overflow_page is not None:
+                raise ValueError('inconsistency in payloadsize and overflow')
+            return None
+
+        # if we get here, we expect overflow
+        if cell.first_overflow_page is None:
+            raise ValueError('missing first_overflow_page number')
+
+        # a namedtuple to represent the overflow
+        _overflow_t = _nt('overflow', 'data slack overflowpages')
+
+        # collect the required overflow in a bytearray
+        data = bytearray()
+        # The toread parameter is used to check if overflow chain ends at the same
+        # moment at which enough bytes are read. In addition, it is used to
+        # separate payload from slack if the payload doesn't end at the last byte
+        # of the last overflow page.
+        toread = cell.payloadsize - len(cell.inline_payload)
+
+        # the last overflow may theoretically have slack
+        slack = None
+
+        # collect the pagenumbers of the overflow pages
+        opages = []
+
+        # iterate over the overflow pages and collect the data
+        nextpage = cell.first_overflow_page
+
+        while nextpage != 0:
+            # add the page to list of overflowpages
+            opages.append(nextpage)
+
+            if toread <= 0:
+                raise ValueError('nextpage found, but no bytes to read left')
+
+            # parse the overflow page
+            opage = s.overflowpage(nextpage)
+            nextpage = opage.next_overflow_page
+
+            # copy the data into the data bytearray
+            if toread >= opage.contents_size:
+                data.extend(opage.get_contents())
+                toread -= opage.contents_size
+            else:
+                contents = opage.get_contents()
+                data.extend(contents[0:toread])
+                slack = contents[toread:]
+                toread = 0
+
+        return _overflow_t(bytes(data), slack, opages)
+
+
+    def payload(s, cell):
+        ''' return payload bytes for given cell, including optional overflow
+        '''
+
+        overflow = s._payload_overflow(cell)
+        if overflow is None:
+            return cell.inline_payload
+        else:
+            return cell.inline_payload + overflow.data
+
+
+# WORK IN PROGRESS BELOW THIS LINE #
+
+    def rowidrecords(s, rootpagenumber):
+        ''' Generates rowid-records for the table-btree starting at the given page.
+
+        Rootpagenumber has to be the number of a table-btree page. There is no
+        sanity check wether this is actually the rootpage of the tree, it just
+        starts handing out records from that point in the tree (intended
+        behaviour).
+        '''
+
+        # parse the rootpage to check pagetype
+        rootpage = s.btreepage(rootpagenumber)
+
+        if rootpage.pagetype != PageType.TableBtreeLeaf:
+            if rootpage.pagetype != PageType.TableBtreeInterior:
+                raise ValueError('Given page is not a Table Btree Page')
+
+        # walk the tree
+        tree = s.btreewalker(rootpagenumber)
+
+        # for table B-tree pages, records are only stored in the table leaf pages
+        for page in tree:
+            if page.pagetype == PageType.TableBtreeLeaf:
+                # yield records on this page in rowid order, not in
+                # cell-location order
+                rowids_on_page = [r for r in page.rowidmap.keys()]
+                rowids_on_page.sort()
+                for rowid in rowids_on_page:
+                    cellnum = page.rowidmap[rowid]
+                    parsed_cell = page.cells[cellnum]
+                    # make logical cell out of raw cell
+                    pload = Payload(s, parsed_cell)
+                    cell = Cell(parsed_cell, pload, cellnum, page.pagenum, page.pageoffset, page.pagesource)
+                    yield RowidRecord(cell)
 
 
     def cellwalker(s, rootpagenumber):
@@ -510,7 +646,7 @@ class Database():
         function to retrieve the cell payload.
         '''
 
-        tree = s.treewalker(rootpagenumber)
+        tree = s.btreewalker(rootpagenumber)
 
         for pg in tree:
             if pg.page.pagetype == 'table_leaf':
@@ -530,7 +666,7 @@ class Database():
         search. If the record is not in the subtree that you start searching in, or
         if the record has been deleted, None is returned.
         '''
-        pg = s.get_page_by_rowid(rootpagenumber, rowid)
+        pg = s.page_by_rowid(rootpagenumber, rowid)
 
         if rowid in pg.page.rowidmap:
             cellnumber = pg.page.rowidmap[rowid]
@@ -565,47 +701,13 @@ class Database():
             # determine the pageoffset within the main database file
             pageoffset = (pagenumber - 1) * s.header.pagesize
 
-            # get the page_data from the main database file, not via get_page_data API
+            # get the page_data from the main database file, not via page_data API
             data = s.data[pageoffset:pageoffset+s.header.pagesize]
             # unpack as a generic page
             page = _structures.genericpage(data, 0, s.header.pagesize)
             from_wal = False
             yield Page(data, page, pagenumber, pageoffset, from_wal)
 
-
-    def rowidrecords(s, rootpagenumber):
-        ''' Generates rowid-records for the table-btree starting at the given page.
-
-        Rootpagenumber has to be the number of a table-btree page. There is no
-        sanity check wether this is actually the rootpage of the tree, it just
-        starts handing out records from that point in the tree (intended
-        behaviour).
-        '''
-
-        # parse the rootpage to check pagetype
-        rootpage = s.get_btreepage(rootpagenumber)
-
-        if rootpage.pagetype != PageType.TableBtreeLeaf:
-            if rootpage.pagetype != PageType.TableBtreeInterior:
-                raise ValueError('Given page is not a Table Btree Page')
-
-        # walk the tree
-        tree = s.treewalker(rootpagenumber)
-
-        # for table B-tree pages, records are only stored in the table leaf pages
-        for page in tree:
-            if page.pagetype == PageType.TableBtreeLeaf:
-                # yield records on this page in rowid order, not in
-                # cell-location order
-                rowids_on_page = [r for r in page.rowidmap.keys()]
-                rowids_on_page.sort()
-                for rowid in rowids_on_page:
-                    cellnum = page.rowidmap[rowid]
-                    parsed_cell = page.cells[cellnum]
-                    # make logical cell out of raw cell
-                    pload = Payload(s, parsed_cell)
-                    cell = Cell(parsed_cell, pload, cellnum, page.pagenum, page.pageoffset, page.pagesource)
-                    yield RowidRecord(cell)
 
 
     def rowidrecord_by_rowid(rootpagenumber, rowid):
@@ -701,9 +803,6 @@ class Table():
 class Payload():
     ''' class representing the payload for a single record, including optional overflow '''
 
-    # a namedtuple to represent the overflow
-    _overflow = _nt('overflow', 'blocklist slack overflowpages')
-
 
     def __init__(s, db, cell):
         ''' create payload object for given cell, including optional overflow
@@ -754,45 +853,7 @@ class Payload():
         return None
 
 
-    def _collect_overflow(s, db, toread, pagenumber):
-        ''' Creates overflow object by parsing overflowpages starting at pagenumber
 
-        The toread parameter is used to check if overflow chain ends at the same
-        moment at which enough bytes are read. In addition, it is used to
-        separate payload from slack if the payload doesn't end at the last byte
-        of the last overflow page. Note that I've not yet seen slack in
-        test databases, so maybe payload calculations are such that no payload
-        slack exists. This remains to be investigated.
-
-        Returns an overflow object, see overflow function for details
-        '''
-
-        pload = []
-        overflowpages = []
-        slack = None
-        nextpage = pagenumber
-
-        while nextpage != 0:
-            overflowpages.append(nextpage)
-            if toread <= 0:
-                raise ValueError('nextpage available but no more bytes to read')
-
-            # get the next overflowpage
-            next_pg_data = db.get_page_data(nextpage)
-
-            # start at offset 0, since we have created a sub bitstream
-            opage = _structures.overflowpage(next_pg_data, 0, db.header.pagesize, db.header.usablepagesize)
-            nextpage = opage.next_overflow_page
-            if toread >= len(opage.payload):
-                pload.append(opage.payload)
-                toread -= len(opage.payload)
-            else:
-                remainder = opage.payload[0:toread]
-                slack = opage.payload[toread:]
-                pload.append(remainder)
-                toread = 0
-
-        return Payload._overflow(pload, slack, overflowpages)
 
 
 class Cell():

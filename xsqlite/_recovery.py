@@ -333,7 +333,7 @@ def _freeblock_walker(db, rootpagenumber):
     - Freeblock : simple wrapper around a parsed freeblock
     '''
 
-    pages = db.treewalker(rootpagenumber)
+    pages = db.btreewalker(rootpagenumber)
     for page in pages:
         for freeblock in page.page.freeblocks:
             yield Freeblock(freeblock, page.pagenumber, page.pageoffset, page.pagesource)
@@ -345,7 +345,7 @@ def _unallocated_walker(db, rootpagenumber):
     NOTE: this is the unallocated area between the cellpointer area and the first cell
     '''
 
-    pages = db.treewalker(rootpagenumber)
+    pages = db.btreewalker(rootpagenumber)
     for page in pages:
 
         yield Unallocated(page.page.unallocated, page.page.unallocated_offset, page.pagenumber, page.pageoffset, page.pagesource)
@@ -441,7 +441,7 @@ def _scan_freelist_for_varints(db, varint_count, rootpage_for_testing=None):
 
     if rootpage_for_testing is not None:
         print("WARNING: running freelist recovery on allocated btree for testing purposes!")
-        pages = db.treewalker(rootpage_for_testing)
+        pages = db.btreewalker(rootpage_for_testing)
     else:
         pages = db.freelist_pages()
 
@@ -466,7 +466,7 @@ def _scan_freelist_for_varints(db, varint_count, rootpage_for_testing=None):
             continue
 
         # if we get here, this is a freelist leafpage, get its data as a block object
-        pagedata = db.get_page_data(pagenumber)
+        pagedata = db.page_data(pagenumber)
         try:
             # try to parse as a btree page
             parsed = _structures.btree_page(pagedata.data(), 0, db.header.pagesize, db.header.usablepagesize)
@@ -528,7 +528,7 @@ def _scan_superseded_pages_for_varints(db, varint_count):
         pageoffset = p.pageoffset
         pagesource = p.pagesource
 
-        # we can not use the get_page_data function here, but we know that the entire page
+        # we can not use the page_data function here, but we know that the entire page
         # is an unallocated block, so we can simply use that block for the pagedata
         pagedata = p.page.unallocated
 
@@ -591,7 +591,7 @@ def _scan_outdated_pages_for_varints(db, varint_count):
         pageoffset = p.pageoffset
         pagesource = p.pagesource
 
-        # we can not use the get_page_data function here, but we know that the entire page
+        # we can not use the page_data function here, but we know that the entire page
         # is an unallocated block, so we can simply use that block for the pagedata
         pagedata = p.page.unallocated
 

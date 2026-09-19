@@ -750,67 +750,6 @@ def freeblock(data, page_offset, freeblock_offset):
 ################
 
 
-# overflow page fields:
-# - pagetype: 'overflow'
-# - next_overflow_page: pagenumber of next overflowpage or 0 (eoc)
-# - payload_offset: relative offset of the payload in the page (4)
-# - reserved_offset: relative offset of the reserved area (usablepagesize)
-# - reserved: the data stored in the reserved area for this page or None
-# - size: the page size (passed in as variable)
-# - payload: bytes with the payload
-_overflowpage = _nt('overflowpage', 'pagetype next_overflow_page '
-                                    'payload_offset reserved_offset size '
-                                    'payload reserved')
-
-
-def overflowpage(data, offset, pagesize, usablepagesize):
-    ''' Parses data at given offset as overflowpage.
-
-    Arguments:
-    - data           : bytes containing the overflow page
-    - offset         : offset of the page within the data
-    - pagesize       : the size of a database page
-    - usablepagesize : start of the reserved area withing the page
-
-    Returns:
-    - overflowpage  : a parsed overflow page
-
-    Note that the last overflow page in a chain may not completely contain
-    payload data. In other words, there may be slack in the chained overflow
-    pages. This has to be determined by the caller, because for this
-    cell-specific information is needed (the payloadsize).
-
-    (Note that conceptually overflow is part of the cell)
-    '''
-
-    # read the next overflowpage pagenumber and restore btstr position
-    next_overflow_page = _unpack_from('>I', data, offset)[0]
-
-    # btree.c, line 5175:
-    #    const u32 ovflSize = pBt->usableSize - 4;  /* Bytes content per ovfl page */
-
-    # From this we learn that overflow pages also have a reserved area (if used)
-    # and that the size of the overflow on a page is limited to usableSize minus 4 for 
-    # the small header with the next overflow page
-
-    # payload and reserved area
-    start = offset + 4
-    psize = usablepagesize - 4
-    end = start + psize
-    payload = data[start:end]
-
-    # reserved area runs from end of cell content area to end of page
-    res = None
-    res_offset = None
-    if pagesize > usablepagesize:
-        res_offset = offset+usablepagesize
-        res = data[res_offset:offset+pagesize]
-        # make the offsets relative to page offset before returning
-        res_offset = res_offset - offset
-
-    return _overflowpage('overflow', next_overflow_page, 4, res_offset, 
-                         pagesize, payload, res)
-
 
 ################
 # generic page #
