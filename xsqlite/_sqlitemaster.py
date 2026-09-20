@@ -33,12 +33,12 @@ class SQLiteMaster():
 
         for rec in master_records:
             record = SQLiteMasterRecord(rec, textencoding)
-
             if record.tbl_type == 'table':
                 if record.virtual is True:
                     s.virtual_tables[record.name] = record
                 else:
-                    s.tables[record.name] = record
+                    tbl = Table(record, textencoding)
+                    s.tables[record.name] = tbl
             elif record.tbl_type == 'index':
                 s.indices[record.name] = record
             elif record.tbl_type == 'view':
@@ -105,3 +105,54 @@ class SQLiteMasterRecord():
             s.tblconstraints = tbldef.tblconstraints
             s.withoutrowid = tbldef.withoutrowid
             s.ipk_column = tbldef.ipk_column
+
+
+class Column():
+    ''' class that represent a column in a Table '''
+
+    def __init__(s, sql_parsed_columndef):
+        ''' initialize a Column object from the given parsed column definition '''
+
+        s.name = sql_parsed_columndef.name
+        s.typename = sql_parsed_columndef.coltype
+        s.affinity = sql_parsed_columndef.affinity
+        s.notnull = sql_parsed_columndef.notnull
+        s.unique = sql_parsed_columndef.unique
+        s.default = sql_parsed_columndef.default
+        s.primary = sql_parsed_columndef.primary
+        s.pkey_sort = sql_parsed_columndef.pkey_sort
+        s.pkey_autoincrement = sql_parsed_columndef.pkey_autoincrement
+        s.constraints = sql_parsed_columndef.constraints
+
+
+class Table():
+    ''' class that represents a the structure of a table an SQLite3 database
+
+    The returned object has two decoder properties. These can be used to decode
+    a single raw record. In order to decode a sequence of raw records from the
+    table 'tbl' you can do something like::
+
+        tblrecs = (tbl.user_decoder(r) for r in db.rowidrecords(tbl.rootpage))
+    '''
+
+    def __init__(s, sqlite_master_record, textencoding):
+        ''' initialize the table object from the given SQLiteMasterRecord '''
+
+        s.master_record = sqlite_master_record
+
+        s.name = sqlite_master_record.name
+        s.rootpage = sqlite_master_record.rootpage
+
+        # reduce column definition to a subset of fields
+        s.columns = [Column(c) for c in sqlite_master_record.columns]
+
+        s.ipk_col = sqlite_master_record.ipk_column
+        s.withoutrowid = sqlite_master_record.withoutrowid
+
+        # prepare body decoder
+        colnames = [c.name for c in s.columns]
+        affinities = [c.affinity for c in s.columns]
+        s.decoder = _decode.BodyDecoder(textencoding, affinities)
+
+        # prepare record viewer
+        s.viewer = _decode.RecordViewer(colnames, s.decoder, s.ipk_col)

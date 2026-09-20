@@ -1,4 +1,4 @@
-''' _structures - basic structures in the SQLite3 file format
+''' _record.py - code related to parsing record structures
 
 Copyright (c) 2014-2026 Netherlands Forensic Institute - MIT License
 Copyright (c) 2025-2026 mxkrt@lsjam.nl - MIT License
@@ -9,97 +9,13 @@ of the database format as given on: https://www.sqlite.org/fileformat.html
 
 from struct import unpack_from as _unpack_from
 from collections import namedtuple as _nt
-
 from ._varint import varint, varints
 
-
-#################
-# record format #
-#################
-
-# recordformat fields:
-# - header: the parsed record header
-# - body: the parsed record body
-_recordformat = _nt('recordformat', 'header body')
-
-# NOTE: offset is not stored intentionally in the parsed header and body, since
-# we may also pass in slices of data which makes the offset relative to the
-# slice, making the offset useless without keeping track of the slice of data
-# passed into the function. The caller is responsible for tracking the offset
-# of the data
-
-
-def recordformat(data, offset):
-    ''' Parse given bytes as recordformat (header + body)
-
-    Arguments:
-    - data     : bytes containing the recordformat structure
-    - offset   : offset of the recordformat structure
-
-    Returns:
-    - recordformat : namedtuple with the parsed recordheader + body
-    '''
-
-    recheader = recordheader(data, offset)
-    bodyoffset = recheader.headersize + offset
-    body = recordbody(data, bodyoffset, recheader)
-    return _recordformat(recheader, body)
-
-
-#################
-# record header #
-#################
-
-# recordheader fields:
-# - headersize : the size of the header in bytes
-# - serialtypes : a sequence of serialtypes as stored in the header
+# namedtuple representing a recordheader
 _recordheader = _nt('recordheader', 'headersize serialtypes')
 
-
-def recordheader(data, offset):
-    ''' Parse given bytes as recordheader
-
-    Arguments:
-    - data     : bytes containing the recordheader structure
-    - offset   : offset of the recordheader structure
-
-    Returns:
-    - recordheader : sequence of serialtype numbers
-    '''
-
-    # parse and unpack headersize varint (value, varint_width)
-    hsize, skip = varint(data, offset)
-
-    # default max number of columns is 2000 and each column may take
-    # up to 5 bytes in record header (varint of 5 bytes is enough for
-    # max size of individual columns)
-    if hsize > 2000 * 5:
-        raise ValueError('columns exceed default maximum.')
-
-    # read varints in remaining header
-    types_offset = offset+skip
-    types_bytecount = hsize-skip
-
-    serialtypes = varints(data, types_offset, types_bytecount)
-    # this function returns tuples, consisting of (varint_value, varint_width) pairs
-    serialtypes = [i[0] for i in serialtypes]
-
-    if len(serialtypes) <= 0:
-        raise ValueError('empty list of serialtypes.')
-
-    return _recordheader(hsize, serialtypes)
-
-
-##############
-# serialtype #
-##############
-
-# serialtype fields:
-# - size : the size of the serialtype in the recordbody
-# - storageclass: NULL, Integer, Real, Text or Blob
-# - parser: format string for struct.unpack
-# - function: post processing function to apply after struct.unpack
-_serialtype = _nt('serialtype', 'size storageclass parser function')
+# namedtuple representing a recordformat structure
+_recordformat = _nt('recordformat', 'header body')
 
 # SQLite uses these 5 storage classes
 _null = _nt('null', 'size value')
@@ -111,6 +27,13 @@ _blob = _nt('blob', 'size value')
 # intbe24 and intbe48 need to be converted separately (and similarly)
 _int24 = lambda b: int.from_bytes(b, 'big', signed=True)
 _int48 = lambda b: int.from_bytes(b, 'big', signed=True)
+
+# namedtuple represeting a serialtype
+# - size: the size of the serialtype in the recordbody
+# - storageclass: NULL, Integer, Real, Text or Blob
+# - parser: format string for struct.unpack
+# - function: post processing function to apply after struct.unpack
+_serialtype = _nt('serialtype', 'size storageclass parser function')
 
 # The fixed-width types and the corresponding parser instruction
 _fixedtypes = {0: _serialtype(0, _null, None, None),
@@ -153,9 +76,38 @@ def serialtype(stype):
         return _fixedtypes[stype]
 
 
-###############
-# record body #
-###############
+def recordheader(data, offset):
+    ''' Parse given bytes as recordheader
+
+    Arguments:
+    - data     : bytes containing the recordheader structure
+    - offset   : offset of the recordheader structure
+
+    Returns:
+    - recordheader : sequence of serialtype numbers
+    '''
+
+    # parse and unpack headersize varint (value, varint_width)
+    hsize, skip = varint(data, offset)
+
+    # default max number of columns is 2000 and each column may take
+    # up to 5 bytes in record header (varint of 5 bytes is enough for
+    # max size of individual columns)
+    if hsize > 2000 * 5:
+        raise ValueError('columns exceed default maximum.')
+
+    # read varints in remaining header
+    types_offset = offset+skip
+    types_bytecount = hsize-skip
+
+    serialtypes = varints(data, types_offset, types_bytecount)
+    # this function returns tuples, consisting of (varint_value, varint_width) pairs
+    serialtypes = tuple(i[0] for i in serialtypes)
+
+    if len(serialtypes) <= 0:
+        raise ValueError('empty list of serialtypes.')
+
+    return _recordheader(hsize, serialtypes)
 
 
 def recordbody(data, offset, recheader):
@@ -167,7 +119,7 @@ def recordbody(data, offset, recheader):
     - recheader : the parsed recordheader with parser instructions
 
     Returns:
-    - body: list of storage class objects for the various objects. 
+    - body: tuple of storage class objects for the various objects. 
 
     Note: Some serial types are not stored in the body, but are determined by the 
     header. These have size 0. The following serial types are defined:
@@ -185,14 +137,14 @@ def recordbody(data, offset, recheader):
     '''
 
     # make list of sizes, storageclases and a parser command from serialtypes
-    stypes = [serialtype(t) for t in recheader.serialtypes]
-    sizes = [s[0] for s in stypes]
-    sclasses = [s[1] for s in stypes]
+    stypes = tuple(serialtype(t) for t in recheader.serialtypes)
+    sizes = tuple(s[0] for s in stypes)
+    sclasses = tuple(s[1] for s in stypes)
 
     # build the parse instruction (big-endian)
-    fmt = '>' + ''.join([s.parser for s in stypes if s.parser is not None])
+    fmt = '>' + ''.join(tuple(s.parser for s in stypes if s.parser is not None))
     # int24 and int48 need post-processing
-    pfuncs = [s.function for s in stypes if s.parser is not None]
+    pfuncs = tuple(s.function for s in stypes if s.parser is not None)
     # parse the bytes
     parsed = list(_unpack_from(fmt, data, offset))
     # apply function to selected fields
@@ -216,7 +168,21 @@ def recordbody(data, offset, recheader):
         else:
             val = parsed.pop(0)
         columns.append(sclass(size, val))
-    return columns
+    return tuple(columns)
 
 
+def recordformat(data, offset):
+    ''' Parse given bytes as recordformat (header + body)
 
+    Arguments:
+    - data     : bytes containing the recordformat structure
+    - offset   : offset of the recordformat structure
+
+    Returns:
+    - recordformat : namedtuple with the parsed recordheader + body
+    '''
+
+    recheader = recordheader(data, offset)
+    bodyoffset = recheader.headersize + offset
+    body = recordbody(data, bodyoffset, recheader)
+    return _recordformat(recheader, body)

@@ -12,7 +12,6 @@ import mmap as _mmap
 from os import stat as _stat
 
 from . import _exceptions
-from . import _structures
 from ._page import Page, PageSource, BtreePage
 
 
@@ -425,11 +424,11 @@ class WalFile():
             yield s.get_frame(i)
 
 
-    def allocated_frames(s):
-        ''' yields the allocated frames that have not been superseded
+    def visible_frames(s):
+        ''' yields all current frames up to mxFrame.
 
-        These frames all exist below mxFrame and are the most recent version for their pagenumber
-        '''
+        These frames all exist below mxFrame and are the most recent version
+        for their pagenumber '''
 
         for pnum, framenum in s._visible_frames.items():
             yield s.get_frame(framenum)

@@ -7,7 +7,7 @@ from collections import namedtuple as _nt
 from collections import OrderedDict as _OD
 import binascii as _binascii
 
-from . import _structures
+from . import _record
 
 
 class BodyDecoder():
@@ -74,12 +74,12 @@ class BodyDecoder():
         # 1) convert integer values in columns with REAL affinity to floats
         realcols = [i for i in range(len(s.affinities)) if s.affinities[i] == 'REAL']
         for col, value in enumerate(values):
-            if stypes[col] == _structures._integer:
+            if stypes[col] == _record._integer:
                 if col in realcols:
                     values[col] = float(values[col])
 
         # 2) decode text values according to db textencoding
-        txtcls = [i for i in range(len(stypes)) if stypes[i] == _structures._text]
+        txtcls = [i for i in range(len(stypes)) if stypes[i] == _record._text]
         error_cols = []
         for col in txtcls:
             try:

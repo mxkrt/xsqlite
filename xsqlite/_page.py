@@ -104,25 +104,25 @@ class Page():
 
 # namedtuple representing a parsed Table B-Tree Interior Cell
 _table_interior_cell_t = _nt('table_interior_cell',
-                             'left_child_pointer key cell_offset cell_size')
+                             'left_child_pointer key offset size')
 
 # namedtuple representing a parsed Table B-Tree Leaf Cell
 _table_leaf_cell_t = _nt('table_leaf_cell',
                          'payloadsize rowid first_overflow_page '
-                         'cell_offset inline_payload_offset cell_size '
+                         'offset inline_payload_offset size '
                          'inline_payload')
 
 # namedtuple representing a parsed Index B-Tree Interior Cell
 _index_interior_cell_t = _nt('index_interior_cell',
                              'left_child_pointer payloadsize '
-                             'first_overflow_page cell_offset '
-                             'inline_payload_offset cell_size '
+                             'first_overflow_page offset '
+                             'inline_payload_offset size '
                              'inline_payload')
 
 # namedtuple representing a parsed Index B-Tree Leaf Cell
 _index_leaf_cell_t = _nt('index_leaf_cell',
                          'payloadsize first_overflow_page '
-                         'cell_offset inline_payload_offset cell_size '
+                         'offset inline_payload_offset size '
                          'inline_payload')
 
 # namedtuple representing a parsed Freeblocks
@@ -702,3 +702,42 @@ class OverflowPage(Page):
         start = s.offset + 4
         end = start + s.contents_size
         return s._data[start:end]
+
+
+class GenericPage(Page):
+    ''' Class representing a Generic Page '''
+
+    def __init__(s, data, offset, pagenum, pagesize, pagesource, usablepagesize):
+        ''' initialize a GenericPage from given data at given offset
+
+        Arguments:
+        - data           : data containing the page at given offset
+        - offset         : offset of the page structure
+        - pagenum        : the pagenumber (derived from offset or wal frame)
+        - pagesize       : the size of the page (derived from database header)
+        - pagesource     : PageSource value (DatabaseFile or WalFile)
+        - usablepagesize : usable page size as calculated from database header
+        '''
+
+        s._data = data
+        s.offset = offset
+        s.size = pagesize
+        s.pagenum = pagenum
+        s.pagesource = pagesource
+        s.usablepagesize = usablepagesize
+        s.pagetype = PageType.FreelistLeaf
+
+        # treat the entire page as unallocated
+        s.unallocated_offset = 0
+        s.unallocated_size = s.usablepagesize
+
+        # attempt to parse the page as a Btree Page
+        try:
+            s.detected_page = BtreePage(s._data, s.offset, s.pagenum, s.size,
+                                        s.pagesource, s.usablepagesize)
+        except:
+            raise ValueError("Work in progress, detect other page types?")
+            s.detected_page = None
+
+        # initialize superclass
+        super().__init__()

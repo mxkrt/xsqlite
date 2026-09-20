@@ -32,7 +32,7 @@ def create_table_statement(db, tablename):
     - db      : the parsed database object
     - outfile : the path of the output file to use
     '''
-    sql = db.sqlite_master.tables[tablename].sql
+    sql = db.sqlite_master.tables[tablename].master_record.sql
     return sql+';\n'
 
 

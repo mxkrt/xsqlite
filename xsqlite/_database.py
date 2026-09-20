@@ -10,26 +10,26 @@ NOTE: indices, views and triggers are not implemented. WITHOUT ROWID tables are
 also not implemented. WAL support is implemented, but JOURNAL support is not. '''
 
 from collections import namedtuple as _nt
-from collections import OrderedDict as _OD
-from functools import partial as _partial
 import os.path as _path
 from os import stat as _stat
-from enum import Enum as _Enum
 from struct import unpack_from as _unpack_from
 import mmap as _mmap
 
-from . import _structures
-from . import _sql
-from . import _decode
 from ._wal import WalFile
 from ._page import PageSource, PageType, Page, BtreePage
 from ._page import FreeListLeafPage, FreeListTrunkPage
-from ._page import OverflowPage
+from ._page import OverflowPage, GenericPage
 from ._sqlitemaster import SQLiteMaster
+from ._record import recordformat
+
+
+# namedtuple representing a rowid record with extra metadata
+_rowidrecord_t = _nt('rowidrecord', 'pagenum pageoffset pagesource '
+                                    'cellnum cell_offset rowid header body')
 
 
 class Database():
-    ''' class representing a SQLite3 database, optionally including wal or journal file '''
+    ''' class representing a SQLite3 database '''
 
 
     def __init__(s, infile, wal=None, journal=None):
@@ -78,23 +78,14 @@ class Database():
             if s.header.pagesize != s.walfile.header.pagesize:
                 raise ValueError("WAL and database header disagree on pagesize")
 
-        return
-
-        # TODO: everything below here should be checked for passing the
-        #       correct data if it is a page from WA
-
-
         # parse sqlite_master table (stored in btree starting in page 1)
         s.sqlite_master = SQLiteMaster(s.rowidrecords(1), s.header.textencoding)
 
-        # create table objects for each of the defined tables
-        s.tables = _OD()
-        for tbl_name, sqlite_master_rec in s.sqlite_master.tables.items():
-            tbl = Table(sqlite_master_rec, s.header.textencoding)
-            s.tables[tbl_name] = tbl
+        # create alias for sqlite_master tables
+        s.tables = s.sqlite_master.tables
 
         # add a list of tablenames for convenience
-        s.tablenames = [n for n in s.tables.keys()]
+        s.tablenames = tuple(n for n in s.tables.keys())
 
 
     def _load_db(s, infile):
@@ -158,7 +149,7 @@ class Database():
                         s.journaldata = _mmap.mmap(jfile.fileno(), 0, access=_mmap.ACCESS_READ)
 
 
-    def parse_header(s, data):
+    def parse_header(s, data, offset=0):
         ''' Parse the database header in given 100 bytes '''
 
         # namedtuple representing the database header
@@ -175,7 +166,7 @@ class Database():
 
         # parse bytes according to Database Header Format
         fmt = '>16sH' + 'B'*6 + 'I'*12 + '20sII'
-        parsed = _unpack_from(fmt, data)
+        parsed = _unpack_from(fmt, data, offset)
 
         headerstring = parsed[0].decode('utf-8')
         if headerstring != 'SQLite format 3\x00':
@@ -332,8 +323,12 @@ class Database():
         return False
 
 
-    def page_offset(s, pagenumber):
-        ''' Return offset of visible page in database or WAL for pagenumber '''
+    def page_offset(s, pagenumber, ignore_wal=False):
+        ''' Return offset of visible page in database or WAL for pagenumber
+
+        if ignore_wal is True, return the offset of the page
+        in the main database, ignoring the WAL file
+        '''
 
         if pagenumber < 1:
             raise ValueError('pagenumbers start at 1 in SQLite fileformat')
@@ -342,10 +337,11 @@ class Database():
             if pagenumber > s.header.dbsize:
                 raise ValueError('pagenumber > inheader dbsize')
 
-        if s.is_page_visible_in_wal(pagenumber):
-            # return the offset of the page data in the WAL file
-            walframe = s.walfile.get_visible_page_frame(pagenumber)
-            return walframe.contents_offset
+        if ignore_wal is False:
+            if s.is_page_visible_in_wal(pagenumber):
+                # return the offset of the page data in the WAL file
+                walframe = s.walfile.get_visible_page_frame(pagenumber)
+                return walframe.contents_offset
 
         if pagenumber > s.externalsize:
             raise ValueError('pagenumber > externalsize')
@@ -354,82 +350,60 @@ class Database():
         return (pagenumber - 1) * s.header.pagesize
 
 
-    def page_data(s, pagenumber):
-        ''' Return page data for visible page with given pagenumber '''
-
-        if s.is_page_visible_in_wal(pagenumber):
-            walframe = s.walfile.get_visible_page_frame(pagenumber)
-            return walframe.contents
-
-        start = s.page_offset(pagenumber)
-        end = start + s.header.pagesize
-        return s.data[start:end]
-
-
-    def btreepage(s, pagenumber):
-        ''' Parse the visible page for given pagenumber as Btree Page '''
+    def _get_page_props(s, pagenumber, ignore_wal=False):
+        ''' get offset, source and data object for page '''
 
         # get the page offset
-        offset = s.page_offset(pagenumber)
+        offset = s.page_offset(pagenumber, ignore_wal)
 
-        if s.is_page_visible_in_wal(pagenumber):
-            pagesource = PageSource.WALFile
-            data = s.walfile.data
-        else:
-            pagesource = PageSource.DatabaseFile
-            data = s.data
+        # defaults
+        pagesource = PageSource.DatabaseFile
+        data = s.data
 
+        if ignore_wal is False:
+            if s.is_page_visible_in_wal(pagenumber):
+                pagesource = PageSource.WALFile
+                data = s.walfile.data
+
+        return offset, pagesource, data
+
+
+    def page_data(s, pagenumber, ignore_wal=False):
+        ''' Return page data for visible page with given pagenumber '''
+
+        offset, pagesource, data = s._get_page_props(pagenumber, ignore_wal)
+        return data[offset:offset + s.header.pagesize]
+
+
+    def btreepage(s, pagenumber, ignore_wal=False):
+        ''' Parse the visible page for given pagenumber as Btree Page
+        '''
+
+        offset, pagesource, data = s._get_page_props(pagenumber, ignore_wal)
         return BtreePage(data, offset, pagenumber, s.header.pagesize,
                          pagesource, s.header.usablepagesize)
 
 
-    def freelisttrunkpage(s, pagenumber):
+    def freelisttrunkpage(s, pagenumber, ignore_wal=False):
         ''' Parse the visible page for given pagenumber as Freelist Trunk Page '''
 
-        # get the page offset
-        offset = s.page_offset(pagenumber)
-
-        if s.is_page_visible_in_wal(pagenumber):
-            pagesource = PageSource.WALFile
-            data = s.walfile.data
-        else:
-            pagesource = PageSource.DatabaseFile
-            data = s.data
-
+        offset, pagesource, data = s._get_page_props(pagenumber, ignore_wal)
         return FreeListTrunkPage(data, offset, pagenumber, s.header.pagesize,
                                  pagesource, s.header.usablepagesize)
 
 
-    def freelistleafpage(s, pagenumber):
+    def freelistleafpage(s, pagenumber, ignore_wal=False):
         ''' Parse the visible page for given pagenumber as Freelist Leaf Page '''
 
-        # get the page offset
-        offset = s.page_offset(pagenumber)
-
-        if s.is_page_visible_in_wal(pagenumber):
-            pagesource = PageSource.WALFile
-            data = s.walfile.data
-        else:
-            pagesource = PageSource.DatabaseFile
-            data = s.data
-
+        offset, pagesource, data = s._get_page_props(pagenumber, ignore_wal)
         return FreeListLeafPage(data, offset, pagenumber, s.header.pagesize,
                                 pagesource, s.header.usablepagesize)
 
 
-    def overflowpage(s, pagenumber):
+    def overflowpage(s, pagenumber, ignore_wal=False):
         ''' Parse the visible page for given pagenumber as Overflow Page '''
 
-        # get the page offset
-        offset = s.page_offset(pagenumber)
-
-        if s.is_page_visible_in_wal(pagenumber):
-            pagesource = PageSource.WALFile
-            data = s.walfile.data
-        else:
-            pagesource = PageSource.DatabaseFile
-            data = s.data
-
+        offset, pagesource, data = s._get_page_props(pagenumber, ignore_wal)
         return OverflowPage(data, offset, pagenumber, s.header.pagesize,
                             pagesource, s.header.usablepagesize)
 
@@ -601,10 +575,8 @@ class Database():
             return cell.inline_payload + overflow.data
 
 
-# WORK IN PROGRESS BELOW THIS LINE #
-
     def rowidrecords(s, rootpagenumber):
-        ''' Generates rowid-records for the table-btree starting at the given page.
+        ''' Generates rowidrecords for the btree starting at the given page.
 
         Rootpagenumber has to be the number of a table-btree page. There is no
         sanity check wether this is actually the rootpage of the tree, it just
@@ -625,365 +597,80 @@ class Database():
         # for table B-tree pages, records are only stored in the table leaf pages
         for page in tree:
             if page.pagetype == PageType.TableBtreeLeaf:
-                # yield records on this page in rowid order, not in
-                # cell-location order
-                rowids_on_page = [r for r in page.rowidmap.keys()]
-                rowids_on_page.sort()
-                for rowid in rowids_on_page:
-                    cellnum = page.rowidmap[rowid]
-                    parsed_cell = page.cells[cellnum]
-                    # make logical cell out of raw cell
-                    pload = Payload(s, parsed_cell)
-                    cell = Cell(parsed_cell, pload, cellnum, page.pagenum, page.pageoffset, page.pagesource)
-                    yield RowidRecord(cell)
+                # yield records on this page in rowid order
+                for rowid in sorted(page.rowidmap.keys()):
+                    cnum = page.rowidmap[rowid]
+                    cell = page.cells[cnum]
+                    pload = s.payload(cell)
+                    rec = recordformat(pload, 0)
+                    yield _rowidrecord_t(page.pagenum, page.offset,
+                                         page.pagesource, cnum,
+                                         cell.offset, rowid, rec.header,
+                                         rec.body)
 
 
-    def cellwalker(s, rootpagenumber):
-        ''' Generates logical cells for a (sub)tree starting at rootpagenumber
-
-        A logical cell is a thin wrapper around the cell as returned by
-        _structures.cell(), which includes the pagenumber, cellnumber and a
-        function to retrieve the cell payload.
-        '''
-
-        tree = s.btreewalker(rootpagenumber)
-
-        for pg in tree:
-            if pg.page.pagetype == 'table_leaf':
-                for idx, c in enumerate(pg.page.cells):
-                    pload = Payload(s, c)
-                    yield Cell(c, pload, idx, pg.pagenumber, pg.pageoffset, pg.pagesource)
-
-
-    def get_cell_by_rowid(s, rootpagenumber, rowid):
-        ''' Returns the logical cell with the given rowid by searching the b-tree.
-
-        A logical cell is a thin wrapper around the cell as returned by
-        _structures.cell(), which includes the pagenumber, cellnumber and a
-        function to retrieve the cell payload.
-
-        See comments in page_by_rowid function for details on where to start the
-        search. If the record is not in the subtree that you start searching in, or
-        if the record has been deleted, None is returned.
-        '''
-        pg = s.page_by_rowid(rootpagenumber, rowid)
-
-        if rowid in pg.page.rowidmap:
-            cellnumber = pg.page.rowidmap[rowid]
-            cell = pg.page.cells[cellnumber]
-            pload = Payload(s, cell)
-            return Cell(cell, pload, cellnumber, pg.pagenumber, pg.pageoffset, pg.pagesource)
-        return None
-
-
-    def superseded_pages(s):
-        ''' Generates a sequence of all pages that have been superseded by a WAL page
-
-        The superseded pages originate from the main database file, for
-        superseded or outdated pages from the WAL itself use the WalFile API
-        functions '''
-
-        if not hasattr(s, 'walfile'):
-            # No WAL file, no superseded pages
-            return
-
-        # pages from the database file that are superseded by a page from a WAL frame
-        for pagenumber in s.walfile._checkpoint_frames.keys():
-            # first check if there is an associated page in the database, since
-            # the WAL can have additional pages that are not yet in database file.
-            # In this case, there is no superseded page for this WAL page in the
-            # main database, so we can skip over these
-            if s.header.inheadersizevalid and pagenumber > s.header.dbsize:
-                continue
-            if not s.header.inheadersizevalid and pagenumber > s.externalsize:
-                continue
-
-            # determine the pageoffset within the main database file
-            pageoffset = (pagenumber - 1) * s.header.pagesize
-
-            # get the page_data from the main database file, not via page_data API
-            data = s.data[pageoffset:pageoffset+s.header.pagesize]
-            # unpack as a generic page
-            page = genericpage(data, 0, s.header.pagesize)
-            from_wal = False
-            yield Page(data, page, pagenumber, pageoffset, from_wal)
-
-
-
-    def rowidrecord_by_rowid(rootpagenumber, rowid):
-        ''' Returns rowidrecord with given rowid by searching b-tree under rootpage
-
-        See comments in page_by_rowid function for details on where to start the
-        search. If the record is not in the subtree that you start searching in, or
-        if the record has been deleted, None is returned.
-
-        Returns a rowidrecord object, see rowidrecord function for details on
-        format
+    def rowidrecord(s, rootpagenumber, rowid):
+        ''' Returns rowidrecord for given rowid
 
         Arguments:
         rootpagenumber : page to start searching on
         rowid          : the rowid you are looking for
         '''
 
-        cell = s.get_cell_by_rowid(rootpagenumber, rowid)
-        if cell is None:
+        try:
+            page = s.page_by_rowid(rootpagenumber, rowid)
+        except ValueError:
             return None
 
-        return RowidRecord(cell)
+        if rowid in page.rowidmap:
+            cnum = page.rowidmap[rowid]
+            cell = page.cells[cnum]
+            pload = s.payload(cell)
+            rec = recordformat(pload, 0)
+            return _rowidrecord_t(page.pagenum, page.offset,
+                                  page.pagesource, cnum,
+                                  cell.offset, rowid, rec.header,
+                                  rec.body)
 
 
-    def recordheaders(s, cls):
-        ''' Generates sequence of recordheaders from a sequence of logical cells.
+    def cell(s, rootpagenumber, rowid):
+        ''' Return cell for given rowid '''
 
-        The sequence of logical cells can be generated using the _logical.cells()
-        function.
+        try:
+            page = s.page_by_rowid(rootpagenumber, rowid)
+        except ValueError:
+            return None
 
-        A logical recordheader is a thin wrapper around the recordheader as returned by
-        _structures.recordheader(), which includes the pagenumber and cellnumber in
-        which the recordheader exists
+        if rowid in page.rowidmap:
+            cnum = page.rowidmap[rowid]
+            cell = page.cells[cnum]
+            return cell
 
-        Arguments:
-        cls            : a sequence of cells
+
+    def superseded_pages(s):
+        ''' Generates sequence of pages in main db supserseded by the WAL
+
+        The sequence contains all pages for which a newer version exists in the
+        visible frames in the WAL (newest versions of each page below mxFrame)
         '''
 
-        for c in cls:
-            data = b''.join(c.payload.blocklist)
-            yield RecordHeader(_structures.recordheader(data, 0), c.cellnumber, c.pagenumber)
+        if not hasattr(s, 'walfile'):
+            # No WAL file, no superseded pages
+            return
 
+        # we read the pages from the main database file
+        pagesource = PageSource.DatabaseFile
 
-class Column():
-    ''' class that represent a column in a Table '''
-
-    def __init__(s, sql_parsed_columndef):
-        ''' initialize a Column object from the given parsed column definition '''
-
-        s.name = sql_parsed_columndef.name
-        s.typename = sql_parsed_columndef.coltype
-        s.affinity = sql_parsed_columndef.affinity
-        s.notnull = sql_parsed_columndef.notnull
-        s.unique = sql_parsed_columndef.unique
-        s.default = sql_parsed_columndef.default
-        s.primary = sql_parsed_columndef.primary
-        s.pkey_sort = sql_parsed_columndef.pkey_sort
-        s.pkey_autoincrement = sql_parsed_columndef.pkey_autoincrement
-        s.constraints = sql_parsed_columndef.constraints
-
-
-class Table():
-    ''' class that represents a the structure of a table an SQLite3 database
-
-    The returned object has two decoder properties. These can be used to decode
-    a single raw record. In order to decode a sequence of raw records from the
-    table 'tbl' you can do something like::
-
-        tblrecs = (tbl.user_decoder(r) for r in db.rowidrecords(tbl.rootpage))
-    '''
-
-    def __init__(s, sqlite_master_record, textencoding):
-        ''' initialize the table object from the given SQLiteMasterRecord '''
-
-        s.name = sqlite_master_record.name
-        s.rootpage = sqlite_master_record.rootpage
-
-        # reduce column definition to a subset of fields
-        s.columns = [Column(c) for c in sqlite_master_record.columns]
-
-        s.ipk_col = sqlite_master_record.ipk_column
-        s.withoutrowid = sqlite_master_record.withoutrowid
-
-        # prepare body decoder
-        colnames = [c.name for c in s.columns]
-        affinities = [c.affinity for c in s.columns]
-        s.decoder = _decode.BodyDecoder(textencoding, affinities)
-
-        # prepare record viewer
-        s.viewer = _decode.RecordViewer(colnames, s.decoder, s.ipk_col)
-
-
-class Payload():
-    ''' class representing the payload for a single record, including optional overflow '''
-
-
-    def __init__(s, db, cell):
-        ''' create payload object for given cell, including optional overflow
-
-        Note that the cell argument can be a raw cell as returned by the
-        _structures.cell() function, but it can also be the cell_wrapper
-        defined in the Database class '''
-
-        if isinstance(cell, Cell):
-            # we need the raw cell for this function
-            cell = cell.parsed_cell
-
-        s.payloadsize = cell.payloadsize
-
-        # construct a list of block objects
-        s.blocklist = [cell.inline_payload]
-        oflow = s._get_overflow(db, cell)
-        s.overflowpages = []
-        s.overflowslack = None
-        if oflow is not None:
-            # extend the list with the overflow blocks
-            s.blocklist.extend(oflow.blocklist)
-            s.overflowpages = oflow.overflowpages
-            s.overflowslack = oflow.slack
-
-
-    def _get_overflow(s, db, cell):
-        ''' returns an overflow object for a cell or None if no overflow exists
-
-        Note that the cell argument can be a raw cell as returned by the
-        _structures.cell() function, but it can also be the wrapper defined
-        in this class
-
-        Returns an overflow object, which consists of the following fields:
-            - blocklist: a list of blocks containing the payload bytes
-            - slack: a single block contains slack, or None
-            - overflowpages: a list of pagenumbers from which overflow was fetched
-        '''
-        if isinstance(cell, Cell):
-            # we need the raw cell for this function
-            cell = cell.parsed_cell
-
-        if cell.payloadsize > len(cell.inline_payload):
-            if cell.first_overflow_page is None:
-                raise ValueError('cell has overflow, but no first_overflow_page')
-            toread = cell.payloadsize - len(cell.inline_payload)
-            return s._collect_overflow(db, toread, cell.first_overflow_page)
-        return None
-
-
-
-
-
-class Cell():
-    ''' wrapper for parsed cell with some extra meta-data '''
-
-    def __init__(s, parsed_cell, payload, cellnumber, pagenumber=None, pageoffset=None, pagesource=None):
-        ''' initialize Cell object, optionally setting pagenumber '''
-
-        s.pagenumber = pagenumber
-        s.pageoffset = pageoffset
-        s.pagesource = pagesource
-        s.cellnumber = cellnumber
-        s.parsed_cell = parsed_cell
-        s.payload = payload
-
-
-class RecordHeader():
-    ''' wrapper for parsed recordheader with some extra meta-data '''
-
-    def __init__(s, parsed_recordheader, cellnumber, pagenumber=None):
-        ''' initialize RecordHeader, optionally setting pagenumber '''
-
-        s.parsed_recordheader = parsed_recordheader
-        s.cellnumber = cellnumber
-        s.pagenumber = pagenumber
-
-
-class RowidRecord():
-    ''' wrapper around recordformat with some extra metadata
-
-    A rowid-record is defined here as a detailed version of what is returned by
-    the _structures.recordformat() function, including information about the page
-    and cell that the record is stored in. This information is only available
-    if a logical cell is passed into this function. If a raw cell is given,
-    pagenumber and cellnumber will be None.
-
-    A rowid-record has the following fields:
-
-        - pagenumber: pagenumber that contains the cell, or None
-        - pagesource: source of the recordpage (main db, WAL)
-        - pageoffset: offset of the page that contains the cell, or None
-        - cellnumber: cellnumber that contains the record, or None
-        - rowid: the rowid of the record
-        - header: the recordformat header object
-        - body: the recordformat body object
-        - inlinesize: size of the inline recordheader and body (inline payload)
-        - payloadsize: size of the cell payload, including overflow
-        - has_overflow: whether or not the cell has payload overflow
-
-        When the table has a INTEGER PRIMARY KEY, this is what is stored in the
-        rowid and the record itself contains a NULL value for that column.
-    '''
-
-    def __init__(s, cell):
-        ''' initialize RowidRecord from given cell'''
-
-        if isinstance(cell, Cell):
-            # we have a logical cell, extract required info
-            s.pagenumber = cell.pagenumber
-            s.pageoffset = cell.pageoffset
-            s.pagesource = cell.pagesource
-            s.cellnumber = cell.cellnumber
-            s.rowid = cell.parsed_cell.rowid
-            s.inlinesize = len(cell.parsed_cell.inline_payload)
-            s.payloadsize = cell.parsed_cell.payloadsize
-            s.payloadoffset = cell.parsed_cell.inline_payload_offset
-            pload = cell.payload
-        else:
-            s.pagenumber = None
-            s.pageoffset = None
-            s.pagesource = None
-            s.cellnumber = None
-            s.rowid = cell.rowid
-            s.inlinesize = len(cell.inline_payload)
-            s.payloadsize = cell.payloadsize
-            s.payloadoffset = cell.inline_payload_offset
-            pload = Payload(s, cell)
-
-        if len(pload.overflowpages) == 0:
-            s.has_overflow = False
-        else:
-            s.has_overflow = True
-
-        # combine the individual blocks into a combined blocklist
-        payload_data = b''.join(pload.blocklist)
-        # check if length matches defined payloadsize (btstr is in bits)
-        if len(payload_data) != s.payloadsize:
-            raise RuntimeError('combined payload is not the correct size')
-
-        # parse as recordformat struct
-        recdata = _structures.recordformat(payload_data, 0)
-        s.header = recdata.header
-        s.body = recdata.body
-
-        # sanity check on payload size and total size of header + body
-        sizes = [_structures.serialtype(t).size for t in recdata.header.serialtypes]
-        definedsize = sum(sizes) + recdata.header.headersize
-        if definedsize != s.payloadsize:
-            raise RuntimeError('mismatch between size in recordheader and payloadsize.')
-
-
-# TODO: this is copied from _structures for now, remove later
-
-################
-# generic page #
-################
-
-# a basic page that treats all data as unallocated
-
-# generic page fields:
-# - pagetype: 'unknown'
-# - unallocated_offset: relative offset of the unallocate space (0)
-# - unallocated: the data stored in the unallocated area for this page
-# - unallocated_size : size of the unallocated space
-# - size: the page size (passed in as variable)
-_genericpage = _nt('genericpage', 'pagetype unallocated_offset unallocated '
-                                  'unallocated_size size')
-
-
-def genericpage(data, offset, pagesize):
-    ''' Parses data at given offset as generic (unallocated) page.
-
-    Arguments:
-
-    - data           : bytes containing the page
-    - offset         : offset of the page within the data
-    - pagesize       : the size of a database page
-
-    Returns:
-    - genericpage     : 'parsed' generic page
-    '''
-    return _genericpage('unknown', 0, data[offset:offset+pagesize], 
-                        pagesize, pagesize)
+        # iterate over the visible frames to determine the pagenumbers
+        # of pages that are superseded in the main database
+        for frame in s.walfile.visible_frames():
+            pgnum = frame.pagenumber
+            # first check if there is an associated page in the database, since
+            # the WAL can have additional pages that are not yet in database file.
+            # In this case, there is no superseded page for this WAL page in the
+            # main database, so we can skip over these
+            if pgnum > s.externalsize:
+                continue
+            offset = s.page_offset(pgnum, ignore_wal=True)
+            yield GenericPage(s.data, offset, pgnum, s.header.pagesize,
+                              pagesource, s.header.usablepagesize)
