@@ -23,9 +23,10 @@ from ._sqlitemaster import SQLiteMaster
 from ._record import recordformat
 
 
-# namedtuple representing a rowid record with extra metadata
+# namedtuple representing a rowid record some additional
+# metadata to locate the record in the database file or WAL
 _rowidrecord_t = _nt('rowidrecord', 'pagenum pageoffset pagesource '
-                                    'cellnum cell_offset rowid header body')
+                                    'cellnum rowid header body')
 
 
 class Database():
@@ -33,7 +34,7 @@ class Database():
 
 
     def __init__(s, infile, wal=None, journal=None):
-        ''' Load given file as Database object, with optional WAL or journal
+        ''' Initialize Database object from infile, with optional WAL or journal
 
         Arguments:
         - infile  : path or file-like object for main database file
@@ -60,9 +61,9 @@ class Database():
         # parse the database header from page 1
         if s.is_page_visible_in_wal(1) is True:
             hdr_frame = s.walfile.get_visible_page_frame(1)
-            s.header = s.parse_header(hdr_frame.contents[0:100])
+            s.header = s._parse_header(hdr_frame.contents[0:100])
         else:
-            s.header = s.parse_header(s.data[0:100])
+            s.header = s._parse_header(s.data[0:100])
 
         # calculated size of database in pages based on available data
         s.externalsize = int(len(s.data) / s.header.pagesize)
@@ -149,8 +150,8 @@ class Database():
                         s.journaldata = _mmap.mmap(jfile.fileno(), 0, access=_mmap.ACCESS_READ)
 
 
-    def parse_header(s, data, offset=0):
-        ''' Parse the database header in given 100 bytes '''
+    def _parse_header(s, data, offset=0):
+        ''' Parse the database header at given offset in given data  '''
 
         # namedtuple representing the database header
         _hdr_t = _nt('database_header',
@@ -316,7 +317,11 @@ class Database():
 
 
     def is_page_visible_in_wal(s, pagenumber):
-        ''' return True if page is visible in WAL file, False otherwise '''
+        ''' return True if page is visible in WAL file, False otherwise
+
+        Arguments:
+        - pagenumber : logical page number
+        '''
 
         if hasattr(s, 'walfile'):
             return s.walfile.is_page_visible(pagenumber)
@@ -326,8 +331,13 @@ class Database():
     def page_offset(s, pagenumber, ignore_wal=False):
         ''' Return offset of visible page in database or WAL for pagenumber
 
-        if ignore_wal is True, return the offset of the page
-        in the main database, ignoring the WAL file
+        Arguments:
+        - pagenumber : the logical page number
+        - ignore_wal : if True, always return offset in the main database
+                       even if page updates exist in the WAL
+
+        Returns:
+        - offset     : offset of page in either main database or WAL
         '''
 
         if pagenumber < 1:
@@ -369,14 +379,31 @@ class Database():
 
 
     def page_data(s, pagenumber, ignore_wal=False):
-        ''' Return page data for visible page with given pagenumber '''
+        ''' Return page data for page with given pagenumber
+
+        Arguments:
+        - pagenumber : the logical page number
+        - ignore_wal : if True, always return bytes from the main database
+                       even if page updates exist in the WAL
+
+        Returns:
+        - data       : array of bytes stored in the given page
+        '''
 
         offset, pagesource, data = s._get_page_props(pagenumber, ignore_wal)
         return data[offset:offset + s.header.pagesize]
 
 
     def btreepage(s, pagenumber, ignore_wal=False):
-        ''' Parse the visible page for given pagenumber as Btree Page
+        ''' Parse the page with given pagenumber as Btree Page
+
+        Arguments:
+        - pagenumber : the logical page number
+        - ignore_wal : if True, always parse the page from the main database
+                       even if updates exist in the WAL
+
+        Returns:
+        - page       : The parsed page object
         '''
 
         offset, pagesource, data = s._get_page_props(pagenumber, ignore_wal)
@@ -385,15 +412,43 @@ class Database():
 
 
     def freelisttrunkpage(s, pagenumber, ignore_wal=False):
-        ''' Parse the visible page for given pagenumber as Freelist Trunk Page '''
+        ''' Parse the page with given pagenumber as Freelist Trunk Page
+
+        Arguments:
+        - pagenumber : the logical page number
+        - ignore_wal : if True, always parse the page from the main database
+                       even if updates exist in the WAL
+
+        Returns:
+        - page       : The parsed page object
+        '''
 
         offset, pagesource, data = s._get_page_props(pagenumber, ignore_wal)
-        return FreeListTrunkPage(data, offset, pagenumber, s.header.pagesize,
-                                 pagesource, s.header.usablepagesize)
+        parsed = FreeListTrunkPage(data, offset, pagenumber, s.header.pagesize,
+                                   pagesource, s.header.usablepagesize)
+
+        # sanitycheck, the freelist leaf pages should exist
+        for ptr in parsed.freelistleafpointers:
+            if ptr > s.externalsize:
+                if hasattr(s, 'walfile'):
+                    if ptr > max(s.walfile.observed_pages):
+                        raise ValueError("freelist leaf pointer points outside db and wal")
+                raise ValueError("freelist leaf pointer points outside db file")
+
+        return parsed
 
 
     def freelistleafpage(s, pagenumber, ignore_wal=False):
-        ''' Parse the visible page for given pagenumber as Freelist Leaf Page '''
+        ''' Parse the page with given pagenumber as Freelist Leaf Page
+
+        Arguments:
+        - pagenumber : the logical page number
+        - ignore_wal : if True, always parse the page from the main database
+                       even if updates exist in the WAL
+
+        Returns:
+        - page       : The parsed page object
+        '''
 
         offset, pagesource, data = s._get_page_props(pagenumber, ignore_wal)
         return FreeListLeafPage(data, offset, pagenumber, s.header.pagesize,
@@ -401,16 +456,45 @@ class Database():
 
 
     def overflowpage(s, pagenumber, ignore_wal=False):
-        ''' Parse the visible page for given pagenumber as Overflow Page '''
+        ''' Parse the page with given pagenumber as Overflow Page
+
+        Arguments:
+        - pagenumber : the logical page number
+        - ignore_wal : if True, always parse the page from the main database
+                       even if updates exist in the WAL
+
+        Returns:
+        - page       : The parsed page object
+        '''
 
         offset, pagesource, data = s._get_page_props(pagenumber, ignore_wal)
-        return OverflowPage(data, offset, pagenumber, s.header.pagesize,
-                            pagesource, s.header.usablepagesize)
+        parsed = OverflowPage(data, offset, pagenumber, s.header.pagesize,
+                              pagesource, s.header.usablepagesize)
+
+        # sanity check, if this is not actually an overflow page, the
+        # next_overflow page may likely point outside the database.
+        next_opage = parsed.next_overflow_page
+        if next_opage > s.externalsize:
+            if hasattr(s, 'walfile'):
+                if next_opage > max(s.walfile.observed_pages):
+                    raise ValueError("next overflowpage outside db and wal")
+            raise ValueError("next overflowpage outside db")
+
+        return parsed
 
 
-    def freelist_pages(s):
-        ''' Generate sequence of visible freelist pages in database '''
+    def freelist_pages(s, ignore_wal=False):
+        ''' Generate sequence of freelist pages in database
 
+        Arguments:
+        - ignore_wal : if True, ignore any pages from the WAL (including the
+                       header page, which might contain an updated pointer to
+                       the first freelist page)
+
+        Yields:
+        - page       : The parsed page object
+        '''
+ 
         def _fpages(pnum):
             ''' yields all freelist pages starting at the given trunkpage '''
 
@@ -418,23 +502,37 @@ class Database():
             if pnum == 0:
                 return
 
-            tpage = s.freelisttrunkpage(pnum)
+            tpage = s.freelisttrunkpage(pnum, ignore_wal)
             yield tpage
 
             # yield all pages pointed to by the leaf pointers in the trunkpage
             for pnum in tpage.freelistleafpointers:
-                yield s.freelistleafpage(pnum)
+                yield s.freelistleafpage(pnum, ignore_wal)
 
             # process the next FreeList Trunk Page
             for pg in _fpages(tpage.nextfreelisttrunkpage):
                 yield pg
 
-        for pg in _fpages(s.header.firstfreelisttrunkpage):
+        if ignore_wal is True:
+            # parse the header from the main database page
+            header = s._parse_header(s.data, 0)
+        else:
+            # use the earlier parsed header, which might be from WAL
+            header = s.header
+
+        for pg in _fpages(header.firstfreelisttrunkpage):
             yield pg
 
 
-    def btreewalker(s, rootpagenumber):
+    def btreewalker(s, rootpagenumber, ignore_wal=False):
         ''' Generate Btree pages starting at given rootpage number.
+
+        Arguments:
+        - rootpagenumber : page number of the btree rootpage
+        - ignore_wal     : if True, ignore any pages from the WAL
+
+        Yields:
+        - page           : the parsed Btree Page
 
         The generated sequence represents the subtree under the given page.
         Both the interior and the leaf table pages are returned so that this
@@ -450,7 +548,7 @@ class Database():
         '''
 
         # start with the rootpage
-        rootpage = s.btreepage(rootpagenumber)
+        rootpage = s.btreepage(rootpagenumber, ignore_wal)
         yield rootpage
 
         # visit the children of interior pages
@@ -459,16 +557,24 @@ class Database():
             # first the left pointers
             for cell in rootpage.cells:
                 subpagenum = cell.left_child_pointer
-                for subpage in s.btreewalker(subpagenum):
+                for subpage in s.btreewalker(subpagenum, ignore_wal):
                     yield subpage
             # and finally the rightmost pointer
             rmp = rootpage.rightmost_pointer
-            for subpage in s.btreewalker(rmp):
+            for subpage in s.btreewalker(rmp, ignore_wal):
                 yield subpage
 
 
-    def page_by_rowid(s, rootpagenumber, rowid):
-        ''' Return page that holds the record with given rowid
+    def page_by_rowid(s, rootpagenumber, rowid, ignore_wal=False):
+        ''' Return visible page that holds the record with given rowid
+
+        Arguments:
+        - rootpagenumber : the pagenumber of the btree to traverse
+        - rowid          : the rowid we are searching for
+        - ignore_wal     : if True, ignore any pages from the WAL
+
+        Returns:
+        - page           : parsed Table Btree Leaf Page with given rowid
 
         NOTE: When a record is removed it is no longer accessible on the
         corresponding page, but the Btree will still lead to a page where the
@@ -481,7 +587,7 @@ class Database():
         table of interest.
         '''
 
-        rootpage = s.btreepage(rootpagenumber)
+        rootpage = s.btreepage(rootpagenumber, ignore_wal)
 
         # a Table Btree Leaf page has no children
         if rootpage.pagetype == PageType.TableBtreeLeaf:
@@ -494,7 +600,8 @@ class Database():
         elif rootpage.pagetype == PageType.TableBtreeInterior:
             if rowid > rootpage.cells[-1].key:
                 # go right: rmp points to subtree were keys are > cells[-1].key
-                return s.page_by_rowid(rootpage.rightmost_pointer, rowid)
+                return s.page_by_rowid(rootpage.rightmost_pointer, rowid,
+                                       ignore_wal)
             else:
                 # go left :leftpointer points to pages were all keys are <= key
                 # from documentation: pointers to the left of a X refer to b-tree
@@ -502,14 +609,15 @@ class Database():
                 for cell in rootpage.cells:
                     lp = cell.left_child_pointer
                     if rowid <= cell.key:
-                        return s.page_by_rowid(lp, rowid)
+                        return s.page_by_rowid(lp, rowid, ignore_wal)
 
         else:
             raise ValueError('Given rootpage is not a Table Btree Page')
 
 
     def _payload_overflow(s, cell):
-        ''' return payload overflow for given parsed cell '''
+        ''' return payload overflow for given parsed cell
+        '''
 
         if cell.payloadsize <= len(cell.inline_payload):
             if cell.first_overflow_page is not None:
@@ -564,7 +672,7 @@ class Database():
         return _overflow_t(bytes(data), slack, opages)
 
 
-    def payload(s, cell):
+    def _payload(s, cell):
         ''' return payload bytes for given cell, including optional overflow
         '''
 
@@ -575,8 +683,15 @@ class Database():
             return cell.inline_payload + overflow.data
 
 
-    def rowidrecords(s, rootpagenumber):
+    def rowidrecords(s, rootpagenumber, ignore_wal=False):
         ''' Generates rowidrecords for the btree starting at the given page.
+
+        Arguments:
+        - rootpagenumber : the pagenumber of rootpage of btree to traverse
+        - ignore_wal     : if True, ignore any pages from the WAL
+
+        Yields:
+        - rowidrecord    : namedtuple with rowidrecord and some metadata
 
         Rootpagenumber has to be the number of a table-btree page. There is no
         sanity check wether this is actually the rootpage of the tree, it just
@@ -585,14 +700,14 @@ class Database():
         '''
 
         # parse the rootpage to check pagetype
-        rootpage = s.btreepage(rootpagenumber)
+        rootpage = s.btreepage(rootpagenumber, ignore_wal)
 
         if rootpage.pagetype != PageType.TableBtreeLeaf:
             if rootpage.pagetype != PageType.TableBtreeInterior:
                 raise ValueError('Given page is not a Table Btree Page')
 
         # walk the tree
-        tree = s.btreewalker(rootpagenumber)
+        tree = s.btreewalker(rootpagenumber, ignore_wal)
 
         # for table B-tree pages, records are only stored in the table leaf pages
         for page in tree:
@@ -601,43 +716,56 @@ class Database():
                 for rowid in sorted(page.rowidmap.keys()):
                     cnum = page.rowidmap[rowid]
                     cell = page.cells[cnum]
-                    pload = s.payload(cell)
+                    pload = s._payload(cell)
                     rec = recordformat(pload, 0)
                     yield _rowidrecord_t(page.pagenum, page.offset,
                                          page.pagesource, cnum,
-                                         cell.offset, rowid, rec.header,
-                                         rec.body)
+                                         rowid, rec.header, rec.body)
 
 
-    def rowidrecord(s, rootpagenumber, rowid):
+    def rowidrecord(s, rootpagenumber, rowid, ignore_wal=False):
         ''' Returns rowidrecord for given rowid
 
         Arguments:
-        rootpagenumber : page to start searching on
-        rowid          : the rowid you are looking for
+        - rootpagenumber : pagenumber of rootpage of btree to traverse
+        - rowid          : the rowid you are looking for
+        - ignore_wal     : if True, ignore any pages from the WAL
+
+        Returns:
+        - rowidrecord    : namedtuple with rowidrecord and some metadata or
+                           None if no such record exists
         '''
 
         try:
-            page = s.page_by_rowid(rootpagenumber, rowid)
+            page = s.page_by_rowid(rootpagenumber, rowid, ignore_wal)
         except ValueError:
             return None
 
         if rowid in page.rowidmap:
             cnum = page.rowidmap[rowid]
             cell = page.cells[cnum]
-            pload = s.payload(cell)
+            pload = s._payload(cell)
             rec = recordformat(pload, 0)
             return _rowidrecord_t(page.pagenum, page.offset,
                                   page.pagesource, cnum,
-                                  cell.offset, rowid, rec.header,
-                                  rec.body)
+                                  rowid, rec.header, rec.body)
 
 
-    def cell(s, rootpagenumber, rowid):
-        ''' Return cell for given rowid '''
+    def cell(s, rootpagenumber, rowid, ignore_wal=False):
+        ''' Return cell for given rowid
+
+        Arguments:
+        - rootpagenumber : pagenumber of rootpage of btree to traverse
+        - rowid          : the rowid you are looking for
+        - ignore_wal     : if True, ignore any pages from the WAL
+
+        Yields:
+        - cell           : the parsed cell containing the record with the rowid
+                           or None if no such cell exists
+        '''
 
         try:
-            page = s.page_by_rowid(rootpagenumber, rowid)
+            page = s.page_by_rowid(rootpagenumber, rowid, ignore_wal)
         except ValueError:
             return None
 
@@ -650,8 +778,14 @@ class Database():
     def superseded_pages(s):
         ''' Generates sequence of pages in main db supserseded by the WAL
 
+        Yields:
+        - page : GenericPage object with optional detected_page property
+
         The sequence contains all pages for which a newer version exists in the
-        visible frames in the WAL (newest versions of each page below mxFrame)
+        visible frames in the WAL (newest versions of each page below mxFrame).
+
+        Pages that can be parsed as a btree page or some other page type have a
+        detected_page property holding the parsed detected page.
         '''
 
         if not hasattr(s, 'walfile'):
