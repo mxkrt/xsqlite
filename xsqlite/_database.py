@@ -431,7 +431,7 @@ class Database():
         for ptr in parsed.freelistleafpointers:
             if ptr > s.externalsize:
                 if hasattr(s, 'walfile'):
-                    if ptr > max(s.walfile.observed_pages):
+                    if ptr > s.walfile.highest_observed_pagenumber:
                         raise ValueError("freelist leaf pointer points outside db and wal")
                 raise ValueError("freelist leaf pointer points outside db file")
 
@@ -476,7 +476,7 @@ class Database():
         next_opage = parsed.next_overflow_page
         if next_opage > s.externalsize:
             if hasattr(s, 'walfile'):
-                if next_opage > max(s.walfile.observed_pages):
+                if next_opage > s.walfile.highest_observed_pagenumber:
                     raise ValueError("next overflowpage outside db and wal")
             raise ValueError("next overflowpage outside db")
 
