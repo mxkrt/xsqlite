@@ -44,11 +44,10 @@ from ._page import Page, PageSource, BtreePage
 # SQLite uses the concept of mxFrame to indicate the frame number of the last
 # valid commit frame. Valid frames after the mxFrame are part of an uncommitted
 # transaction. If the .shm file (which holds the mxFrame field) is not present,
-# the mxFrame is determined as by doing a single pass over the WAL, from
-# beginning to end. The checksums are verified on each frame of the WAL as it
-# is read. The scan stops at the end of the file or at the first invalid
-# checksum. The mxFrame field is set to the index of the last valid commit
-# frame in WAL.
+# the mxFrame is determined by doing a single pass over the WAL, from beginning
+# to end. The checksums are verified on each frame of the WAL as it is read.
+# The scan stops at the end of the file or at the first invalid checksum. The
+# mxFrame field is set to the index of the last valid commit frame in WAL.
 
 # Periodically, the content of the WAL is transferred back into the database
 # file in an operation called a "checkpoint". This operation *does not* clear
@@ -61,8 +60,8 @@ from ._page import Page, PageSource, BtreePage
 
 # A single WAL file can be reused multiple times after a reset. In other words,
 # the WAL can fill up with frames that are backfilled into the main database
-# and then new frames can overwrite the old ones. A WAL always grows from
-# beginning toward the end.
+# and then new frames can (partially) overwrite the old ones. A WAL always
+# grows from beginning toward the end.
 
 # From this page: https://sqlite.org/fileformat2.html#walformat we learn that
 # "after a complete checkpoint, if no other connections are in transactions
@@ -86,7 +85,7 @@ from ._page import Page, PageSource, BtreePage
 #   +----------------------------+
 #   | header, salt1=A, salt2=B   |
 #   +----------------------------+
-#   | frame 1, salt1=A, salt2=B  | <- generation 0,
+#   | frame 1, salt1=A, salt2=B  | <- generation 0 start
 #   | page 1, dbsize=0           |
 #   +----------------------------+
 #   | frame 2, salt1=A, salt2=B  |
@@ -105,13 +104,13 @@ from ._page import Page, PageSource, BtreePage
 #   | page 4, dbsize=Y           |    end snapshot 1
 #   +----------------------------+
 #   | frame 7, salt1=A, salt2=B  | <- uncommitted frame
-#   | page 5, dbsize=0           |    (no final commit frame)
+#   | page 5, dbsize=0           |
 #   +----------------------------+
-#   | frame 8, salt1=A, salt2=B  |
+#   | frame 8, salt1=A, salt2=B  | <- uncommitted frame
 #   | page 1, dbsize=0           |
 #   +----------------------------+
-#   | frame 9, salt1=C, salt2=D  | <- remains generation 1
-#   | page 2, dbsize=Z           |
+#   | frame 9, salt1=C, salt2=D  | <- remaining frames from
+#   | page 2, dbsize=Z           |    earlier generation
 #   +----------------------------+
 #   | frame10, salt1=C, salt2=D  |
 #   | page 3, dbsize=0           |
@@ -174,7 +173,6 @@ class WalFile():
             s.slack_offset = 32 + (s.frame_count * s.frame_size)
             s.slack = s.data[s.slack_offset:s.slack_offset+s.slack_size]
 
-
         # Group wal frames by WAL-generation and set the prior_to_reset
         # variable to True if the salt values match those in the WAL header
         # (which indicates that frames up to mxFrame should be read from the
@@ -186,10 +184,6 @@ class WalFile():
 
         # determine the last valid frame that is also a commit frame
         s._determine_mxFrame()
-
-        if s.uncommitted_valid_frames is True:
-            print("[!] WARNING: aborted transaction in WAL encountered")
-            print("             This scenario needs some work in xsqlite!")
 
         # determine the valid commit frames within the current generation
         s._determine_snapshot_frames()
@@ -375,7 +369,12 @@ class WalFile():
 
 
     def _determine_mxFrame(s):
-        ''' determine the last valid frame that is also a commit frame '''
+        ''' determine the last valid frame that is also a commit frame 
+
+        This function also determines if there are any corrupt frames in the
+        current WAL-generation and if there are any uncommitted valid frames in
+        this generation.
+        '''
 
         # default value if no valid commit frames exist
         s.mxFrame = 0
@@ -387,20 +386,22 @@ class WalFile():
             return
 
         # determine upper_limit for mxFrame detection
-        current_frames = s.generation_frames[0]
-        if current_frames[-1] < s.highest_valid_checksum_frame:
-            # This indicates that outdated frames exist with valid checksums,
-            # which should not happen. If this message is printed,
-            # we need to do some more investigation into why this occurs
-            print("[!] WARNING: outdated frames with valid checksum detected!")
-            print("             This scenario needs some work in xsqlite!")
-            upper_limit = current_frames[-1]
-        elif current_frames[-1] > s.highest_valid_checksum_frame:
-            # This indicates some form of corruption in the current frames
-            # Set the upper limit to the higest frame with a valid checksum.
-            print("[!] WARNING: corrupt current frames detected!")
-            print("             This scenario needs some work in xsqlite!")
+        s._corrupt_current_frames = None
+        if s.generation_frames[0][-1] < s.highest_valid_checksum_frame:
+            # This indicates that frames from an older generation exist 
+            # with a valid checksum. This is unlikely to happen.
+            upper_limit = s.generation_frames[0][-1]
+            # Raise an exception so we can investigate when this occurs
+            # and how to deal with this properly
+            msg = "Outdated frames with valid checksums detected!"
+            raise ValueError(msg)
+        elif s.generation_frames[0][-1] > s.highest_valid_checksum_frame:
+            # This indicates some form of corruption in the current frames,
+            # so mxFrame is limited by the highest frame with a valid checksum
             upper_limit = s.highest_valid_checksum_frame
+            start = s.highest_valid_checksum_frame + 1
+            end = s.generation_frames[0][-1]
+            s._corrupt_current_frames = (start, end)
         else:
             upper_limit = s.highest_valid_checksum_frame
 
@@ -412,13 +413,17 @@ class WalFile():
                 # this is a commit frame, update mxFrame value
                 s.mxFrame = fnum
 
-        if s.mxFrame != current_frames[-1]:
-            # This probably indicates that a transaction was in progress at the
+        s._uncommitted_valid_frames = None
+        if s.mxFrame != s.generation_frames[0][-1]:
+            # This indicates that a transaction was in progress at the
             # moment the sqlite proces died. There are uncommitted changes in
             # the WAL that are not ended with a commit frame.
-            s.uncommitted_valid_frames = True
-        else:
-            s.uncommitted_valid_frames = False
+            start = s.mxFrame + 1
+            if s._corrupt_current_frames is None:
+                end = s.generation_frames[0][-1]
+            else:
+                end = s._corrupt_current_frames[0] - 1
+            s._uncommitted_valid_frames = (start, end)
 
 
     def _determine_snapshot_frames(s):
@@ -545,6 +550,9 @@ class WalFile():
         - frame   : visible frame for given page, or None
         '''
 
+        if not s.is_page_visible(pagenum, snapshot):
+            return None
+
         if snapshot == -1:
             snapshot = s.snapshot_count - 1
 
@@ -597,8 +605,27 @@ class WalFile():
             yield s.get_frame(i)
 
 
-# TODO: all above this line has been refactored
+    def uncommitted_valid_frames(s):
+        ''' yield valid frames > mxFrame in current generation '''
 
+        if s._uncommitted_valid_frames is None:
+            return
+        start, end = s._uncommitted_valid_frames
+        for i in range(start, end+1):
+            yield s.get_frame(i)
+
+
+    def corrupt_current_frames(s):
+        ''' yield corrupt frames > mxFrame in current generation '''
+
+        if s._corrupt_current_frames is None:
+            return
+        start, end = s._corrupt_current_frames
+        for i in range(start, end+1):
+            yield s.get_frame(i)
+
+
+# TODO: all above this line has been refactored
 
 
     def outdated_frames(s):
