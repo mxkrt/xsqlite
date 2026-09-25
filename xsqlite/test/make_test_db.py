@@ -10,7 +10,7 @@ import os.path
 import shutil
 import tempfile
 import binascii
-
+import time
 
 # target for the file with checkpointed and truncated WAL
 TARGET1 = 'xsqlite_test_with_wal.db'
@@ -50,7 +50,12 @@ def generate_testdb():
         log.write('[set journalmode to WAL]\n')
         cur.execute('''PRAGMA wal_autocheckpoint = 0''')
         log.write('[disable wal autocheckpoint]\n')
-
+        cur.execute("PRAGMA synchronous=FULL")
+        log.write('[set synchronous to full to force frequent flushing]\n')
+        cur.execute("PRAGMA cache_size=10")
+        log.write('[decrease page cache size]\n')
+        cur.execute("PRAGMA cache_spill=ON")
+        log.write('[enable cache_spill to allow dirty pages writes]\n')
         # create test table
         cur.execute('''DROP TABLE IF EXISTS table_one''')
         cur.execute('''
@@ -139,6 +144,30 @@ def generate_testdb():
 
         con.commit()
         log.write(f'[commit]\n')
+
+        # add a final record and delete 5 records without commit, to force uncommitted frame
+        i = 15001
+        blb = random.randbytes(50)
+        txt = randomstring(random.randint(0,100))
+        real = random.random() * random.randint(0,1000)
+        nmbr = random.randint(0,2**63)
+        cur.execute("INSERT INTO table_one VALUES(?,?,?,?,?,?,?)",(i, i*2, f"record_{i}", txt, nmbr, real, sqlite3.Binary(blb),))
+        log.write(f'INSERT:\ttable_one\t{i}\t{i*2}\trecord_{i}\t{txt}\t{nmbr}\t{real}\t{binascii.hexlify(blb)}\n')
+ 
+        # delete 5 random records
+        for i in range(0, 5):
+            id_ = random.randint(300,15000)
+            cur.execute(f"DELETE FROM table_one WHERE id = {id_}")
+            log.write(f'DELETE:\ttable_one\trecord_{id_}\n')
+
+        # wait to give OS time to flush pages
+        time.sleep(5)
+
+        # delete another 20 random records
+        for i in range(0, 20):
+            id_ = random.randint(300,15000)
+            cur.execute(f"DELETE FROM table_one WHERE id = {id_}")
+            log.write(f'DELETE:\ttable_one\trecord_{id_}\n')
 
         # copy main db + wal to prevent cleaning up
         shutil.copy(dbfile, '.')
